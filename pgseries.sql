@@ -1281,80 +1281,93 @@ BEGIN
     BEGIN
         EXECUTE format('SELECT count(*) FROM %I.%I', p_schema, p_table)
         INTO v_nrows;
-        FOR r IN SELECT * FROM pgseries._colinfo(
-                     p_schema, p_table, s.time_column,
-                     COALESCE(p_segmentby, '{}'))
-                 WHERE kind = 'data' LOOP
-            IF pgseries._eff_codec(COALESCE(p_codecs, '{}'),
-                                   r.attname::TEXT, r.class) <> 'auto' THEN
-                CONTINUE;
-            END IF;
-            -- Base map: explicit entries + class defaults (auto->for).
-            v_base := '{}';
-            FOR r2 IN SELECT * FROM pgseries._colinfo(
+        IF v_nrows = 0 THEN
+            -- Empty table: nothing to measure; for everywhere.
+            FOR r IN SELECT * FROM pgseries._colinfo(
                          p_schema, p_table, s.time_column,
                          COALESCE(p_segmentby, '{}'))
                      WHERE kind = 'data' LOOP
-                v_base := v_base || jsonb_build_object(r2.attname::TEXT,
-                    CASE WHEN pgseries._eff_codec(COALESCE(p_codecs, '{}'),
-                                                 r2.attname::TEXT,
-                                                 r2.class) = 'auto'
-                         THEN 'for'
-                         ELSE pgseries._eff_codec(COALESCE(p_codecs, '{}'),
-                                                  r2.attname::TEXT,
-                                                  r2.class) END);
+                IF pgseries._eff_codec(COALESCE(p_codecs, '{}'),
+                                       r.attname::TEXT, r.class) = 'auto' THEN
+                    RAISE NOTICE 'pgseries: empty table, auto codec for % -> for',
+                        r.attname;
+                    p_codecs := COALESCE(p_codecs, '{}')
+                                || jsonb_build_object(r.attname::TEXT, 'for');
+                END IF;
             END LOOP;
-            IF v_nrows = 0 THEN
-                RAISE NOTICE 'pgseries: empty table, auto codec for % -> for',
-                    r.attname;
-                p_codecs := COALESCE(p_codecs, '{}')
-                            || jsonb_build_object(r.attname::TEXT, 'for');
-                CONTINUE;
-            END IF;
-            -- for-vs-delta bout on a 20K-row sample; keep smaller bytes.
+        ELSE
+            -- One shared sample. NOTE: built from SELECT *, so generated
+            -- columns materialize as plain data here; the bout maps are
+            -- built from the SAMPLE's columns, not the parent's.
             EXECUTE format('CREATE TEMP TABLE auto_src AS SELECT * FROM %I.%I '
                            || 'ORDER BY %I %s LIMIT 20000',
                 p_schema, p_table, v_ob,
                 CASE WHEN p_orderby_desc THEN 'DESC' ELSE 'ASC' END);
-            v_map_f := v_base || jsonb_build_object(r.attname::TEXT, 'for');
-            v_map_d := v_base || jsonb_build_object(r.attname::TEXT, 'delta');
-            FOR v_ddl IN SELECT * FROM pgseries._compressed_ddl(
-                             'pg_temp', 'auto_src', 'pg_temp.auto_f',
-                             v_map_f, COALESCE(p_segmentby, '{}'), false) LOOP
-                EXECUTE v_ddl;
+            FOR r IN SELECT * FROM pgseries._colinfo(
+                         p_schema, p_table, s.time_column,
+                         COALESCE(p_segmentby, '{}'))
+                     WHERE kind = 'data' LOOP
+                IF pgseries._eff_codec(COALESCE(p_codecs, '{}'),
+                                       r.attname::TEXT, r.class) <> 'auto' THEN
+                    CONTINUE;
+                END IF;
+                -- Base map over SAMPLE columns: parent-explicit entries
+                -- win, anything else (incl. materialized generated cols
+                -- and other auto cols) falls back to for.
+                v_base := '{}';
+                FOR r2 IN SELECT * FROM pgseries._colinfo(
+                             'pg_temp', 'auto_src', s.time_column,
+                             COALESCE(p_segmentby, '{}'))
+                         WHERE kind = 'data' LOOP
+                    v_base := v_base || jsonb_build_object(r2.attname::TEXT,
+                        CASE WHEN COALESCE(p_codecs, '{}') ->> r2.attname::TEXT
+                                  NOT IN ('auto', NULL)
+                             THEN COALESCE(p_codecs, '{}') ->> r2.attname::TEXT
+                             WHEN pgseries._default_codec(r2.class) = 'auto'
+                             THEN 'for'
+                             ELSE pgseries._default_codec(r2.class) END);
+                END LOOP;
+                -- for-vs-delta bout on the sample; keep smaller bytes.
+                v_map_f := v_base || jsonb_build_object(r.attname::TEXT, 'for');
+                v_map_d := v_base || jsonb_build_object(r.attname::TEXT, 'delta');
+                FOR v_ddl IN SELECT * FROM pgseries._compressed_ddl(
+                                 'pg_temp', 'auto_src', 'pg_temp.auto_f',
+                                 v_map_f, COALESCE(p_segmentby, '{}'), false) LOOP
+                    EXECUTE v_ddl;
+                END LOOP;
+                PERFORM pgseries._pack_segments(
+                    'pg_temp', 'auto_src', 'pg_temp', 'auto_f',
+                    s.time_column, s.time_col_type, COALESCE(p_segmentby, '{}'),
+                    s.time_column, false, LEAST(p_segment_rows, 1000),
+                    v_map_f, COALESCE(p_requant, '{}'));
+                SELECT pg_total_relation_size('pg_temp.auto_f') INTO v_bf;
+                FOR v_ddl IN SELECT * FROM pgseries._compressed_ddl(
+                                 'pg_temp', 'auto_src', 'pg_temp.auto_d',
+                                 v_map_d, COALESCE(p_segmentby, '{}'), false) LOOP
+                    EXECUTE v_ddl;
+                END LOOP;
+                PERFORM pgseries._pack_segments(
+                    'pg_temp', 'auto_src', 'pg_temp', 'auto_d',
+                    s.time_column, s.time_col_type, COALESCE(p_segmentby, '{}'),
+                    s.time_column, false, LEAST(p_segment_rows, 1000),
+                    v_map_d, COALESCE(p_requant, '{}'));
+                SELECT pg_total_relation_size('pg_temp.auto_d') INTO v_bd;
+                IF v_bd < v_bf THEN
+                    RAISE NOTICE 'pgseries: auto codec for % -> delta (% vs % bytes)',
+                        r.attname, v_bd, v_bf;
+                    p_codecs := COALESCE(p_codecs, '{}')
+                                || jsonb_build_object(r.attname::TEXT, 'delta');
+                ELSE
+                    RAISE NOTICE 'pgseries: auto codec for % -> for (% vs % bytes)',
+                        r.attname, v_bf, v_bd;
+                    p_codecs := COALESCE(p_codecs, '{}')
+                                || jsonb_build_object(r.attname::TEXT, 'for');
+                END IF;
+                DROP TABLE pg_temp.auto_f;
+                DROP TABLE pg_temp.auto_d;
             END LOOP;
-            PERFORM pgseries._pack_segments(
-                'pg_temp', 'auto_src', 'pg_temp', 'auto_f',
-                s.time_column, s.time_col_type, COALESCE(p_segmentby, '{}'),
-                s.time_column, false, LEAST(p_segment_rows, 1000),
-                v_map_f, COALESCE(p_requant, '{}'));
-            SELECT pg_total_relation_size('pg_temp.auto_f') INTO v_bf;
-            FOR v_ddl IN SELECT * FROM pgseries._compressed_ddl(
-                             'pg_temp', 'auto_src', 'pg_temp.auto_d',
-                             v_map_d, COALESCE(p_segmentby, '{}'), false) LOOP
-                EXECUTE v_ddl;
-            END LOOP;
-            PERFORM pgseries._pack_segments(
-                'pg_temp', 'auto_src', 'pg_temp', 'auto_d',
-                s.time_column, s.time_col_type, COALESCE(p_segmentby, '{}'),
-                s.time_column, false, LEAST(p_segment_rows, 1000),
-                v_map_d, COALESCE(p_requant, '{}'));
-            SELECT pg_total_relation_size('pg_temp.auto_d') INTO v_bd;
-            IF v_bd < v_bf THEN
-                RAISE NOTICE 'pgseries: auto codec for % -> delta (% vs % bytes)',
-                    r.attname, v_bd, v_bf;
-                p_codecs := COALESCE(p_codecs, '{}')
-                            || jsonb_build_object(r.attname::TEXT, 'delta');
-            ELSE
-                RAISE NOTICE 'pgseries: auto codec for % -> for (% vs % bytes)',
-                    r.attname, v_bf, v_bd;
-                p_codecs := COALESCE(p_codecs, '{}')
-                            || jsonb_build_object(r.attname::TEXT, 'for');
-            END IF;
-            DROP TABLE pg_temp.auto_f;
-            DROP TABLE pg_temp.auto_d;
             DROP TABLE pg_temp.auto_src;
-        END LOOP;
+        END IF;
     END resolve_auto;
 
     -- Template tree + BRIN + read-only row trigger (verified: fires
