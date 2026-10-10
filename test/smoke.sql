@@ -422,7 +422,7 @@ DO $$ BEGIN
         RAISE EXCEPTION 'no old chunk to compress';
     END IF;
 END $$;
-SELECT pgseries.compress_chunk('public', 'metrics', (SELECT victim FROM pgseries_victim)) AS compress_out;
+SELECT pgseries.compress_chunk('public', 'metrics', (SELECT victim FROM pgseries_victim), 1) AS compress_out;
 DO $$
 BEGIN
     IF (SELECT count(*) FROM (SELECT * FROM public.metrics_read EXCEPT SELECT * FROM public.metrics_pre) d) <> 0 THEN
@@ -482,7 +482,7 @@ BEGIN
         RAISE EXCEPTION 'heap diverged after decompress';
     END IF;
 END $$;
-SELECT pgseries.compress_chunk('public', 'metrics', (SELECT victim FROM pgseries_victim)) AS recompress_out;
+SELECT pgseries.compress_chunk('public', 'metrics', (SELECT victim FROM pgseries_victim), 1) AS recompress_out;
 DO $$
 BEGIN
     IF (SELECT count(*) FROM (SELECT * FROM public.metrics_read EXCEPT SELECT * FROM public.metrics_pre) d) <> 0 THEN
@@ -522,7 +522,7 @@ SELECT pgseries.move_default('public', 'logs') AS logs_moved;
 CREATE TEMP TABLE pgseries_victim2 AS
 SELECT chunk_name AS victim FROM pgseries.show_chunks('public', 'logs')
 WHERE range_lower < now() - INTERVAL '30 days' LIMIT 1;
-SELECT pgseries.compress_chunk('public', 'logs', (SELECT victim FROM pgseries_victim2)) AS logs_compress;
+SELECT pgseries.compress_chunk('public', 'logs', (SELECT victim FROM pgseries_victim2), 1) AS logs_compress;
 SELECT * FROM pgseries.drop_chunks('public', 'logs', '30 days') AS logs_dropped;
 DO $$
 BEGIN
@@ -626,7 +626,8 @@ BEGIN
     SELECT count(*) INTO v_h FROM public.bulk_heap;
     IF v_comp < 3 THEN RAISE EXCEPTION 'want >=3 compressed, got %', v_comp; END IF;
     IF v_base <> 5000 THEN RAISE EXCEPTION 'base lost rows: %', v_base; END IF;
-    IF v_h <> 0 THEN RAISE EXCEPTION 'heaps not drained: %', v_h; END IF;
+    -- min-rows guard: only sub-segment leftovers may remain in heaps.
+    IF v_h >= 1000 THEN RAISE EXCEPTION 'heaps not drained: %', v_h; END IF;
     IF v_ready < 3 THEN RAISE EXCEPTION 'precreated hot chunks must stay ready, got %', v_ready; END IF;
     -- hot chunk excluded by default: fresh row + rerun compresses nothing.
     INSERT INTO public.bulk (t, device, v) VALUES (now(), 'hot', 1);
@@ -636,6 +637,27 @@ BEGIN
     SELECT pgseries.compress_table('public', 'bulk', NULL, true) INTO v_txt;
     IF (SELECT count(*) FROM public.bulk) <> 5001 THEN
         RAISE EXCEPTION 'hot include lost rows';
+    END IF;
+    -- min-rows guard: the 1-row hot chunk is cold-eligible now but too
+    -- small (default minimum = segment_rows); explicit override packs.
+    SELECT chunk_name INTO v_txt
+    FROM pgseries.compressed_chunk_stats('public', 'bulk')
+    WHERE state = 'ready' AND heap_rows > 0 LIMIT 1;
+    IF (SELECT pgseries.compress_chunk('public', 'bulk', v_txt::NAME))
+       NOT LIKE 'too small%' THEN
+        RAISE EXCEPTION 'tiny chunk must be skipped, got %', v_txt;
+    END IF;
+    IF (SELECT state FROM pgseries.show_chunks('public', 'bulk')
+        WHERE chunk_name = v_txt) <> 'ready' THEN
+        RAISE EXCEPTION 'skipped chunk must stay ready';
+    END IF;
+    PERFORM pgseries.compress_chunk('public', 'bulk', v_txt::NAME, 1);
+    IF (SELECT state FROM pgseries.show_chunks('public', 'bulk')
+        WHERE chunk_name = v_txt) <> 'compressed' THEN
+        RAISE EXCEPTION 'override must compress the tiny chunk';
+    END IF;
+    IF (SELECT count(*) FROM public.bulk) <> 5001 THEN
+        RAISE EXCEPTION 'override lost rows';
     END IF;
 END $$;
 

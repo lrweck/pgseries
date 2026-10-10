@@ -265,6 +265,104 @@ AS $$
     SELECT (p_table::TEXT || '_default')::NAME;
 $$;
 
+-- Bounded representative sample of a series table as a single SQL
+-- string: UNION ALL over the K most recent leaves per branch (heap
+-- leaves raw, compressed leaves via unpack), each LIMIT-capped, so
+-- cost is bounded by ~2x p_nrows rows read — no full scan, no sort,
+-- no TABLESAMPLE page-granularity flakiness (SYSTEM returns 0 rows
+-- too often across many small partitions), no reltuples trust.
+-- Deterministic for a fixed catalog (leaves ordered by range).
+-- Input order is irrelevant: _pack_segments sorts by orderby itself.
+CREATE OR REPLACE FUNCTION pgseries._sample_sql(
+    p_schema NAME, p_table NAME, p_nrows INTEGER)
+RETURNS TEXT
+LANGUAGE plpgsql STABLE
+SET search_path = pgseries, pg_catalog
+AS $$
+DECLARE
+    v_heapq  TEXT := pgseries._write_parent(p_schema, p_table);
+    v_ctpl   TEXT := format('%I.%I', p_schema, p_table || '_compressed');
+    v_unpack TEXT := 'pgseries.unpack_' || pgseries._slug(p_schema, p_table);
+    v_k      INTEGER := 24;
+    v_kold   INTEGER := 8;
+    v_cap    INTEGER := GREATEST(p_nrows / 16, 25);
+    v_segcap INTEGER := GREATEST(p_nrows / 1000 / 4, 2);
+    v_heap   TEXT;
+    v_old    TEXT := '';
+    v_comp   TEXT;
+BEGIN
+    -- Recent-leaning spread of heap leaves (catalog range order;
+    -- adopted chunks without parsed bounds sort last and still
+    -- participate). Recent-only sampling misses backfilled tables
+    -- whose newest chunks are pre-created empties, so the oldest
+    -- leaves outside the recent set are added too. Caps keep every
+    -- leaf scan bounded (LIMIT stops early; empty leaves are ~1ms).
+    SELECT COALESCE(string_agg(
+               format('(SELECT * FROM %I.%I LIMIT %s)',
+                      c.chunk_schema, c.chunk_name, v_cap),
+               ' UNION ALL '), '')
+    INTO v_heap
+    FROM (SELECT c.chunk_schema, c.chunk_name
+          FROM pgseries.chunk c
+          WHERE c.series_schema = p_schema AND c.series_table = p_table
+          ORDER BY c.range_lower DESC NULLS LAST, c.chunk_name DESC
+          LIMIT v_k) c;
+    SELECT COALESCE(string_agg(
+               format('(SELECT * FROM %I.%I LIMIT %s)',
+                      c.chunk_schema, c.chunk_name, v_cap),
+               ' UNION ALL '), '')
+    FROM (SELECT c.chunk_schema, c.chunk_name
+          FROM pgseries.chunk c
+          WHERE c.series_schema = p_schema AND c.series_table = p_table
+            AND (c.chunk_schema, c.chunk_name) NOT IN (
+                SELECT c2.chunk_schema, c2.chunk_name
+                FROM pgseries.chunk c2
+                WHERE c2.series_schema = p_schema
+                  AND c2.series_table = p_table
+                ORDER BY c2.range_lower DESC NULLS LAST, c2.chunk_name DESC
+                LIMIT v_k)
+          ORDER BY c.range_lower ASC NULLS LAST, c.chunk_name ASC
+          LIMIT v_kold) c
+    INTO v_old;
+    IF v_old <> '' THEN
+        v_heap := v_heap
+            || CASE WHEN v_heap <> '' THEN ' UNION ALL ' ELSE '' END
+            || v_old;
+    END IF;
+    -- K most recent compressed leaves, unpacked (cap in segments).
+    IF to_regclass(v_ctpl) IS NOT NULL
+       AND to_regproc(v_unpack) IS NOT NULL THEN
+        SELECT COALESCE(string_agg(
+                   format('(SELECT u.* FROM (SELECT * FROM %I.%I LIMIT %s) AS c, '
+                          || 'LATERAL %s(c) AS u)',
+                          c.chunk_schema,
+                          (c.chunk_name::TEXT || '_compressed')::NAME,
+                          v_segcap, v_unpack),
+                   ' UNION ALL '), '')
+        INTO v_comp
+        FROM (SELECT c.chunk_schema, c.chunk_name
+              FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id)
+              WHERE c.series_schema = p_schema AND c.series_table = p_table
+                AND l.state IN ('compressing', 'compressed')
+                AND to_regclass(format('%I.%I', c.chunk_schema,
+                                       (c.chunk_name::TEXT || '_compressed')::NAME))
+                    IS NOT NULL
+              ORDER BY c.range_lower DESC NULLS LAST, c.chunk_name DESC
+              LIMIT 8) c;
+    ELSE
+        v_comp := '';
+    END IF;
+    IF v_heap = '' AND v_comp = '' THEN
+        -- No cataloged chunks (unregistered table?): fall back to the
+        -- parents directly, LIMIT-capped with early-stop scans.
+        v_heap := format('(SELECT * FROM %s LIMIT %s)', v_heapq, v_cap);
+    END IF;
+    RETURN v_heap
+        || CASE WHEN v_heap <> '' AND v_comp <> ''
+                THEN ' UNION ALL ' ELSE '' END
+        || v_comp;
+END;
+$$;
 -- Write-parent resolution. Before any compression policy exists the
 -- series table is a plain partitioned table and writes target it
 -- directly. add_compression_policy renames it to <table>_heap and
@@ -1631,6 +1729,52 @@ BEGIN
         END IF;
     END resolve_auto;
 
+    <<resolve_dict>>
+    DECLARE
+        v_dcols TEXT;
+        v_nd    BIGINT;
+    BEGIN
+        -- dict on high-cardinality text is pure loss: the per-segment
+        -- dictionary dwarfs the data (measured: 340 KB of uuid dict per
+        -- 1000-row segment for zero gain) and pack's
+        -- array_position(dict, x) is O(n*d) per segment. Resolve to raw
+        -- when the sample distinct count exceeds one segment's worth of
+        -- rows; stored resolved like auto.
+        SELECT string_agg(quote_ident(c.attname), ', ')
+        INTO v_dcols
+        FROM pgseries._colinfo(p_schema, p_table, s.time_column,
+                               COALESCE(p_segmentby, '{}')) c
+        WHERE c.kind = 'data' AND c.class = 'text'
+          AND pgseries._eff_codec(COALESCE(p_codecs, '{}'),
+                                  c.attname::TEXT, c.class) = 'dict';
+        IF v_dcols IS NOT NULL THEN
+            -- Bounded recent-rows sample (heap leaves + unpacked
+            -- compressed segs); distinct counts only over dict cols.
+            EXECUTE 'CREATE TEMP TABLE dict_src AS SELECT '
+                    || v_dcols || ' FROM ('
+                    || pgseries._sample_sql(p_schema, p_table, 20000)
+                    || ') s LIMIT 20000';
+            FOR r IN SELECT * FROM pgseries._colinfo(
+                         p_schema, p_table, s.time_column,
+                         COALESCE(p_segmentby, '{}'))
+                     WHERE kind = 'data' AND class = 'text' LOOP
+                IF pgseries._eff_codec(COALESCE(p_codecs, '{}'),
+                                       r.attname::TEXT, r.class) <> 'dict' THEN
+                    CONTINUE;
+                END IF;
+                EXECUTE format('SELECT count(DISTINCT %I) FROM pg_temp.dict_src',
+                               r.attname) INTO v_nd;
+                IF v_nd > p_segment_rows THEN
+                    RAISE NOTICE 'pgseries: dict on high-cardinality % (% distinct in sample) -> raw',
+                        r.attname, v_nd;
+                    p_codecs := COALESCE(p_codecs, '{}')
+                                || jsonb_build_object(r.attname::TEXT, 'raw');
+                END IF;
+            END LOOP;
+            DROP TABLE pg_temp.dict_src;
+        END IF;
+    END resolve_dict;
+
     -- Template tree + BRIN + read-only row trigger (verified: fires
     -- for direct-partition writes too).
     FOR v_ddl IN SELECT * FROM pgseries._compressed_ddl(
@@ -1774,8 +1918,10 @@ $$;
 -- Pack one chunk's heap rows as new segments. Uniform for first
 -- compression and recompression (late-write staging merges as fresh
 -- segments). Returns a human summary.
+DROP FUNCTION IF EXISTS pgseries.compress_chunk(NAME, NAME, NAME);
 CREATE OR REPLACE FUNCTION pgseries.compress_chunk(
-    p_schema NAME, p_table NAME, p_chunk NAME)
+    p_schema NAME, p_table NAME, p_chunk NAME,
+    p_min_rows INTEGER DEFAULT NULL)
 RETURNS TEXT
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1792,6 +1938,7 @@ DECLARE
     v_heap   BIGINT;
     v_segs   BIGINT;
     v_idx    RECORD;
+    v_min    INTEGER;
 BEGIN
     s := pgseries._series(p_schema, p_table);
     SELECT * INTO pol FROM pgseries.compression_policy
@@ -1825,6 +1972,15 @@ BEGIN
     EXECUTE format('SELECT count(*) FROM %I.%I', p_schema, p_chunk)
     INTO v_heap;
     v_cpart := (p_chunk::TEXT || '_compressed')::NAME;
+    -- Cold AND big enough: below one segment's worth of rows the
+    -- per-segment overhead dominates (measured: a 500-row chunk grew
+    -- 64 kB -> 136 kB). Skipped chunks stay ready for a later tick.
+    v_min := COALESCE(p_min_rows, pol.segment_rows);
+    IF v_heap > 0 AND v_heap < v_min THEN
+        RAISE NOTICE 'pgseries: chunk %.% has % rows (< % minimum), skipping compression',
+            p_schema, p_chunk, v_heap, v_min;
+        RETURN format('too small (%s rows < %s minimum), skipped', v_heap, v_min);
+    END IF;
     IF v_heap = 0 THEN
         IF to_regclass(format('%I.%I', p_schema, v_cpart)) IS NULL THEN
             RAISE NOTICE 'pgseries: chunk %.% heap is empty, nothing to compress',
@@ -1888,11 +2044,15 @@ $$;
 -- (p_include_hot opts the live chunk in); p_older_than further
 -- restricts to chunks below a cutoff. Empty heaps are skipped via a
 -- single UNION ALL count probe — pre-created future chunks must never
--- flip to compressed. Returns a human summary.
+-- flip to compressed. Chunks below p_min_rows (default: one segment's
+-- worth) are skipped: cold AND big enough, or not at all.
+-- Returns a human summary.
+DROP FUNCTION IF EXISTS pgseries.compress_table(NAME, NAME, INTERVAL, BOOLEAN);
 CREATE OR REPLACE FUNCTION pgseries.compress_table(
     p_schema NAME, p_table NAME,
     p_older_than INTERVAL DEFAULT NULL,
-    p_include_hot BOOLEAN DEFAULT false)
+    p_include_hot BOOLEAN DEFAULT false,
+    p_min_rows INTEGER DEFAULT NULL)
 RETURNS TEXT
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1914,6 +2074,8 @@ DECLARE
     v_where  TEXT;
     v_sql    TEXT;
     v_cpart  NAME;
+    v_minrows INTEGER;
+    v_skipped INTEGER;
     r        RECORD;
 BEGIN
     s := pgseries._series(p_schema, p_table);
@@ -1958,6 +2120,14 @@ BEGIN
             || 'FROM h WHERE h.cn = l.cn';
     END IF;
     DELETE FROM pgseries_compress_list WHERE heap_n <= 0;
+    v_minrows := COALESCE(p_min_rows, pol.segment_rows);
+    SELECT count(*) INTO v_skipped FROM pgseries_compress_list
+    WHERE heap_n < v_minrows;
+    DELETE FROM pgseries_compress_list WHERE heap_n < v_minrows;
+    IF v_skipped > 0 THEN
+        RAISE NOTICE 'pgseries: skipping % tiny chunks (< % rows)',
+            v_skipped, v_minrows;
+    END IF;
     SELECT count(*) INTO v_nchunk FROM pgseries_compress_list;
     IF v_nchunk = 0 THEN
         RETURN 'nothing eligible to compress';
@@ -2102,9 +2272,12 @@ BEGIN
 END;
 $$;
 
--- Empirical codec comparison: packs a heap sample into temp tables
+-- Empirical codec comparison: packs a bounded recent-rows sample
+-- (leaf-based, no full scan/sort — see _sample_sql) into temp tables
 -- under each candidate and reports bytes/row. Default candidates pit
 -- the spec pipeline (for+dict) against delta and delta-of-delta.
+-- Per-candidate 'codecs' objects override per-column codecs; dict
+-- columns get the policy guard so bench measures what a policy stores.
 DROP FUNCTION IF EXISTS pgseries.bench_codecs(NAME, NAME, NAME[], INTEGER, JSONB);
 CREATE OR REPLACE FUNCTION pgseries.bench_codecs(
     p_schema NAME, p_table NAME,
@@ -2131,6 +2304,7 @@ DECLARE
     v_rows   BIGINT;
     v_heap   BIGINT;
     v_bytes  BIGINT;
+    v_nd     BIGINT;
     v_ddl    TEXT;
     v_tgt    TEXT;
     i        INTEGER := 0;
@@ -2139,9 +2313,14 @@ DECLARE
     v_t1     TIMESTAMPTZ;
 BEGIN
     s := pgseries._series(p_schema, p_table);
-    EXECUTE format('CREATE TEMP TABLE bench_src AS SELECT * FROM %I.%I '
-                   || 'ORDER BY %I LIMIT %s',
-        p_schema, p_table, s.time_column, p_limit);
+    -- Bounded sample of recent rows: UNION ALL over the K most recent
+    -- leaves per branch (heap raw + sampled compressed segments
+    -- unpacked), each LIMIT-capped. No full scan, no sort, no
+    -- TABLESAMPLE (slow and flaky across many small partitions).
+    -- Input order is irrelevant: _pack_segments sorts by orderby.
+    EXECUTE 'CREATE TEMP TABLE bench_src AS SELECT * FROM ('
+            || pgseries._sample_sql(p_schema, p_table, p_limit)
+            || ') s LIMIT ' || p_limit::TEXT;
     EXECUTE 'SELECT count(*) FROM pg_temp.bench_src' INTO v_rows;
     IF v_rows = 0 THEN
         RAISE EXCEPTION 'pgseries: nothing to benchmark (empty table)'
@@ -2161,11 +2340,19 @@ BEGIN
             v_seg := COALESCE(p_segmentby, '{}');
         END IF;
 
-        -- Resolve per-column codecs by class.
-        v_codecs := '{}';
+        -- Resolve per-column codecs by class; an optional per-column
+        -- 'codecs' object on the candidate wins (suggest uses it to
+        -- keep high-cardinality text out of dict while kneeing).
+        -- Unmentioned dict columns get the policy guard: dict on
+        -- high-cardinality text is pure loss (O(n*d) pack + fat
+        -- dicts), so bench measures what a policy would store.
+        v_codecs := COALESCE(v_cand -> 'codecs', '{}');
         FOR r IN SELECT * FROM pgseries._colinfo(
                      'pg_temp', 'bench_src', s.time_column, v_seg) LOOP
             IF r.kind <> 'data' THEN
+                CONTINUE;
+            END IF;
+            IF v_codecs ? r.attname::TEXT THEN
                 CONTINUE;
             END IF;
             v_codecs := v_codecs || jsonb_build_object(r.attname::TEXT,
@@ -2176,6 +2363,21 @@ BEGIN
                     WHEN r.class = 'text' THEN v_cand ->> 'text'
                     ELSE 'raw'
                 END);
+        END LOOP;
+        FOR r IN SELECT * FROM pgseries._colinfo(
+                     'pg_temp', 'bench_src', s.time_column, v_seg)
+                 WHERE kind = 'data' AND class = 'text' LOOP
+            IF v_codecs ->> r.attname::TEXT <> 'dict'
+               OR (v_cand -> 'codecs') ? r.attname::TEXT THEN
+                CONTINUE;
+            END IF;
+            EXECUTE format('SELECT count(DISTINCT %I) FROM pg_temp.bench_src',
+                           r.attname) INTO v_nd;
+            IF v_nd > COALESCE((v_cand ->> 'segment_rows')::INTEGER, 1000) THEN
+                RAISE NOTICE 'pgseries: bench %: dict on high-cardinality % (% distinct) -> raw',
+                    v_cand ->> 'name', r.attname, v_nd;
+                v_codecs := v_codecs || jsonb_build_object(r.attname::TEXT, 'raw');
+            END IF;
         END LOOP;
 
         IF to_regclass('pg_temp.' || quote_ident(v_tgt)) IS NOT NULL THEN
@@ -2192,7 +2394,8 @@ BEGIN
             COALESCE((v_cand ->> 'segment_rows')::INTEGER, 1000),
             v_codecs, '{}');
         v_t1 := clock_timestamp();
-        EXECUTE format('ANALYZE pg_temp.%I', v_tgt);
+        -- No ANALYZE: sizes come from pg_total_relation_size, which
+        -- needs no stats (an ANALYZE per candidate was a wasted scan).
         EXECUTE format('SELECT pg_total_relation_size(%L)',
                        'pg_temp.' || v_tgt) INTO v_bytes;
 
@@ -2233,42 +2436,106 @@ DECLARE
 BEGIN
     s := pgseries._series(p_schema, p_table);
 
-    -- Segmentby heuristic: lowest-cardinality text-like column in a
-    -- sample (needles group rows; >10K distinct warns anyway).
+    -- Segmentby heuristic: lowest-cardinality text-like column from
+    -- planner stats (no scan). Warms the stats with one ANALYZE when
+    -- missing — still a single scan versus one sorted
+    -- count(DISTINCT) per text column before. Counts are recorded for
+    -- the dict guard below.
     <<pick_segby>>
     DECLARE
         v_best_n BIGINT := NULL;
+        v_heapq  TEXT := pgseries._write_parent(p_schema, p_table);
+        v_nd     NUMERIC;
+        v_rel    BIGINT;
+        v_stats_hit BOOLEAN := false;
     BEGIN
+        CREATE TEMP TABLE IF NOT EXISTS suggest_nd (col NAME PRIMARY KEY, nd BIGINT)
+            ON COMMIT DROP;
+        DELETE FROM suggest_nd;
+        SELECT reltuples::BIGINT INTO v_rel FROM pg_class
+        WHERE oid = to_regclass(v_heapq);
+        -- Fast path: planner stats on the heap parent (present when the
+        -- heap holds data and has been analyzed).
+        IF COALESCE(v_rel, 0) > 0
+           AND EXISTS (SELECT 1 FROM pg_stats
+                       WHERE schemaname = p_schema::TEXT
+                         AND tablename = pgseries._heap_name(p_table)::TEXT
+                          OR (schemaname = p_schema::TEXT
+                              AND tablename = p_table::TEXT)) THEN
+            v_stats_hit := true;
+        END IF;
+        IF v_stats_hit THEN
         FOR r IN SELECT * FROM pgseries._colinfo(
                      p_schema, p_table, s.time_column, '{}')
                  WHERE kind = 'data' AND class = 'text' LOOP
-            EXECUTE format('SELECT count(DISTINCT %I) FROM '
-                           || '(SELECT * FROM %I.%I ORDER BY %I DESC LIMIT %s) t',
-                r.attname, p_schema, p_table, s.time_column, p_sample_rows)
-            INTO v_n;
+            SELECT n_distinct INTO v_nd FROM pg_stats
+            WHERE schemaname = p_schema::TEXT
+              AND tablename IN (pgseries._heap_name(p_table)::TEXT,
+                                p_table::TEXT)
+              AND attname = r.attname::TEXT
+            ORDER BY tablename DESC LIMIT 1;
+            IF v_nd IS NULL THEN
+                CONTINUE;
+            END IF;
+            v_n := CASE WHEN v_nd < 0
+                        THEN ((-v_nd) * COALESCE(v_rel, 0))::BIGINT
+                        ELSE v_nd::BIGINT END;
+            INSERT INTO suggest_nd VALUES (r.attname, v_n)
+            ON CONFLICT (col) DO UPDATE SET nd = EXCLUDED.nd;
             IF v_n > 1 AND v_n <= 10000
                AND (v_best_n IS NULL OR v_n < v_best_n) THEN
                 v_best_n := v_n;
                 v_col := r.attname;
             END IF;
         END LOOP;
+        ELSE
+            -- Slow path (heap empty or unanalyzed — e.g. fully
+            -- compressed tables): exact counts on one bounded 20K
+            -- sample across both branches. Still no full sort.
+            RAISE NOTICE 'pgseries: no usable heap stats, sampling for segmentby...';
+            EXECUTE 'CREATE TEMP TABLE segby_src AS SELECT * FROM ('
+                    || pgseries._sample_sql(p_schema, p_table, 20000)
+                    || ') s LIMIT 20000';
+            FOR r IN SELECT * FROM pgseries._colinfo(
+                         p_schema, p_table, s.time_column, '{}')
+                     WHERE kind = 'data' AND class = 'text' LOOP
+                EXECUTE format('SELECT count(DISTINCT %I) FROM pg_temp.segby_src',
+                               r.attname) INTO v_n;
+                INSERT INTO suggest_nd VALUES (r.attname, v_n)
+                ON CONFLICT (col) DO UPDATE SET nd = EXCLUDED.nd;
+                IF v_n > 1 AND v_n <= 10000
+                   AND (v_best_n IS NULL OR v_n < v_best_n) THEN
+                    v_best_n := v_n;
+                    v_col := r.attname;
+                END IF;
+            END LOOP;
+            DROP TABLE pg_temp.segby_src;
+        END IF;
         IF v_col IS NOT NULL THEN
             v_seg := ARRAY[v_col];
-            RAISE NOTICE 'pgseries: segmentby % (% distinct values in sample)',
-                v_col, v_best_n;
+            RAISE NOTICE 'pgseries: segmentby % (~% distinct values, %)',
+                v_col, v_best_n,
+                CASE WHEN v_stats_hit THEN 'planner stats' ELSE 'exact sample' END;
         ELSE
             RAISE NOTICE 'pgseries: no suitable segmentby column, packing ungrouped';
         END IF;
     END pick_segby;
 
-    -- Knee over segment sizes (delta family throughout).
+    -- Knee over segment sizes (delta family throughout). High-card
+    -- text stays raw even here via per-candidate codec overrides —
+    -- otherwise the knee would pay dict's O(n*d) on every candidate.
     CREATE TEMP TABLE suggest_bench AS
     SELECT * FROM pgseries.bench_codecs(p_schema, p_table, v_seg,
         LEAST(p_sample_rows, 200000),
-        '[{"name":"d_500","temporal":"delta","ints":"delta","text":"dict","segment_rows":500},
-          {"name":"d_1k","temporal":"delta","ints":"delta","text":"dict","segment_rows":1000},
-          {"name":"d_2k","temporal":"delta","ints":"delta","text":"dict","segment_rows":2000},
-          {"name":"d_5k","temporal":"delta","ints":"delta","text":"dict","segment_rows":5000}]');
+        (SELECT jsonb_agg(c)
+         FROM (VALUES
+           ('d_500', 500), ('d_1k', 1000), ('d_2k', 2000), ('d_5k', 5000))
+         AS k(nm, sr),
+         LATERAL (SELECT jsonb_build_object(
+             'name', nm, 'temporal', 'delta', 'ints', 'delta',
+             'text', 'dict', 'segment_rows', sr, 'codecs',
+             (SELECT COALESCE(jsonb_object_agg(col, 'raw'), '{}')
+              FROM suggest_nd WHERE nd > sr)) AS c) t));
     SELECT min(bytes) INTO v_best FROM suggest_bench;
     SELECT b.segment_rows INTO segment_rows FROM suggest_bench b
     WHERE b.bytes <= v_best * 1.05
@@ -2283,7 +2550,12 @@ BEGIN
             CASE WHEN r.typename LIKE 'timestamp%' OR r.typename = 'date'
                       THEN 'delta'
                  WHEN r.class = 'int' THEN 'delta'
-                 WHEN r.class = 'text' THEN 'dict'
+                 WHEN r.class = 'text'
+                      AND COALESCE((SELECT nd FROM suggest_nd
+                                    WHERE col = r.attname),
+                                   segment_rows) <= segment_rows
+                      THEN 'dict'
+                 WHEN r.class = 'text' THEN 'raw'
                  ELSE 'raw' END);
     END LOOP;
     SELECT round(1 / NULLIF(min(
@@ -2339,6 +2611,10 @@ $$;
 -- integer arithmetic on micros/days); floats are RAW (float
 -- reassociation is not bit-exact); text-like/bool/uuid/inet/arrays
 -- go through text form + dict/raw; jsonb/bytea/numeric are native RAW.
+-- dict resolves to raw at policy time when the sample distinct count
+-- exceeds one segment's rows (high-card dicts are pure loss: fat
+-- per-segment dictionaries plus O(n*d) pack lookups — measured 340 KB
+-- of uuid dict per 1000-row segment for zero gain).
 -- NULLs are int[] positions (sparse-friendly; the spec's bitmap is
 -- equivalent but needs a custom aggregate in pure SQL).
 --
@@ -2578,10 +2854,15 @@ BEGIN
                     format('(SELECT COALESCE(array_agg(j), ''{}'') FROM generate_subscripts(%I, 1) AS j WHERE (%I)[j] IS NULL)',
                            v_a, v_a), v_pfx || '_nulls')
             WHEN v_codec = 'dict' THEN
+                -- Indices via a mapping LEFT JOIN (hash, O(n+d)), NOT
+                -- array_position per element (O(n*d) per segment —
+                -- measured 7x pack blowup at seg10k on mid-cardinality
+                -- text). LEFT (not INNER) so NULL slots stay aligned;
+                -- the outer nulls CASE covers them as before.
                 format('%s AS %I, %s AS %I, %s AS %I',
                     v_dict, v_pfx || '_dict',
-                    format('(SELECT array_agg(CASE WHEN (%I)[j] IS NULL THEN NULL ELSE array_position(%s, (%I)[j]) END) FROM generate_subscripts(%I, 1) AS j)',
-                           v_a, v_dict, v_a, v_a), v_pfx || '_arr',
+                    format('(SELECT array_agg(m.p ORDER BY u.o) FROM unnest(%I) WITH ORDINALITY AS u(x, o) LEFT JOIN (SELECT d, row_number() OVER () AS p FROM unnest(%s) AS d) AS m ON m.d = u.x)',
+                           v_a, v_dict), v_pfx || '_arr',
                     format('(SELECT COALESCE(array_agg(j), ''{}'') FROM generate_subscripts(%I, 1) AS j WHERE (%I)[j] IS NULL)',
                            v_a, v_a), v_pfx || '_nulls')
             ELSE -- raw (any class): plain array; text keeps TEXT[] arr
