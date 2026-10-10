@@ -369,11 +369,32 @@ BEGIN
         RAISE EXCEPTION 'time segmentby must be rejected';
     EXCEPTION WHEN invalid_parameter_value THEN NULL;
     END;
+    BEGIN PERFORM pgseries.add_compression_policy('public', 'metrics', '{}', 't', false, 100, '{"t": "delta2"}');
+        RAISE EXCEPTION 'delta2 must be rejected (removed)';
+    EXCEPTION WHEN invalid_parameter_value THEN NULL;
+    END;
 END $$;
-SELECT pgseries.add_compression_policy('public', 'metrics', '{device}', 't', false, 100, '{"t": "delta2"}');
+-- auto resolution by measurement: monotonic t -> delta, hash-noise r -> for
+CREATE TABLE public.autots (t TIMESTAMPTZ NOT NULL, r BIGINT);
+INSERT INTO public.autots
+SELECT '2026-01-01 00:00+00'::timestamptz + (s || ' minutes')::interval,
+       abs(hashtextextended(s::text, 0) % 1000000000)
+FROM generate_series(1, 20000) AS s;
+SELECT pgseries.create_series_table('public', 'autots', 't', '1 day');
+SELECT pgseries.add_compression_policy('public', 'autots', '{}', 't', false, 1000, '{}');
+DO $$
+DECLARE v_c JSONB;
+BEGIN
+    SELECT codecs INTO v_c FROM pgseries.compression_policy WHERE series_table = 'autots';
+    IF v_c ->> 't' <> 'delta' THEN RAISE EXCEPTION 'auto failed for ts: %', v_c; END IF;
+    IF v_c ->> 'r' <> 'for' THEN RAISE EXCEPTION 'auto failed for noise: %', v_c; END IF;
+    IF v_c::TEXT LIKE '%auto%' THEN RAISE EXCEPTION 'unresolved auto stored: %', v_c; END IF;
+END $$;
+SELECT pgseries.add_compression_policy('public', 'metrics', '{device}', 't', false, 100, '{"t": "delta"}');
 DO $$
 BEGIN
-    IF (SELECT count(*) FROM pgseries_information.compression_settings) <> 1 THEN
+    IF (SELECT count(*) FROM pgseries_information.compression_settings
+        WHERE series_table = 'metrics') <> 1 THEN
         RAISE EXCEPTION 'policy not registered';
     END IF;
     IF to_regclass('public.metrics_compressed') IS NULL THEN
@@ -469,23 +490,33 @@ BEGIN
     END IF;
 END $$;
 
-DO $$ BEGIN RAISE NOTICE '--- 18. bench_codecs: delta2 must beat raw ---'; END $$;
+DO $$ BEGIN RAISE NOTICE '--- 18b. suggest_compression ---'; END $$;
+SELECT * FROM pgseries.suggest_compression('public', 'metrics', 370);
+DO $$
+DECLARE v_seg NAME[]; v_sql TEXT; v_ratio NUMERIC;
+BEGIN
+    SELECT segmentby, policy_sql, expected_ratio INTO v_seg, v_sql, v_ratio
+    FROM pgseries.suggest_compression('public', 'metrics', 370);
+    IF v_seg <> '{device}' THEN RAISE EXCEPTION 'suggest missed segmentby: %', v_seg; END IF;
+    IF v_sql NOT LIKE '%add_compression_policy(%' THEN RAISE EXCEPTION 'no policy sql'; END IF;
+    IF v_ratio IS NULL OR v_ratio < 1 THEN RAISE EXCEPTION 'bad ratio %', v_ratio; END IF;
+END $$;
 SELECT * FROM pgseries.bench_codecs('public', 'metrics', '{device}', 370);
 DO $$
 DECLARE v_raw BIGINT; v_d2 BIGINT; v_ratio NUMERIC;
 BEGIN
     SELECT bytes INTO v_raw FROM pgseries.bench_codecs('public', 'metrics', '{device}', 370) WHERE name = 'raw';
-    SELECT bytes, ratio_vs_heap INTO v_d2, v_ratio FROM pgseries.bench_codecs('public', 'metrics', '{device}', 370) WHERE name = 'delta2';
+    SELECT bytes, ratio_vs_heap INTO v_d2, v_ratio FROM pgseries.bench_codecs('public', 'metrics', '{device}', 370) WHERE name = 'delta';
     IF v_d2 > v_raw THEN
-        RAISE EXCEPTION 'delta2 (%) bigger than raw (%) on regular data', v_d2, v_raw;
+        RAISE EXCEPTION 'delta (%) bigger than raw (%) on regular data', v_d2, v_raw;
     END IF;
     IF v_ratio >= 1 THEN
-        RAISE EXCEPTION 'delta2 not smaller than heap (ratio %)', v_ratio;
+        RAISE EXCEPTION 'delta not smaller than heap (ratio %)', v_ratio;
     END IF;
 END $$;
 
 DO $$ BEGIN RAISE NOTICE '--- 19. retention drops compressed sibling ---'; END $$;
-SELECT pgseries.add_compression_policy('public', 'logs', '{msg}', 't', false, 100, '{"t": "delta2"}');
+SELECT pgseries.add_compression_policy('public', 'logs', '{msg}', 't', false, 100, '{"t": "delta"}');
 INSERT INTO public.logs VALUES (now() - INTERVAL '60 days', 'oldmsg');
 SELECT pgseries.move_default('public', 'logs') AS logs_moved;
 CREATE TEMP TABLE pgseries_victim2 AS

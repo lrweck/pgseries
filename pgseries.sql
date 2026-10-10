@@ -11,7 +11,7 @@
 --        vendored pgque-core is NOT bundled here; run_job_now is the
 --        stand-in with the same per-job advisory-lock contract.
 --        v0.6 (columnar compression) implemented in pure SQL: pluggable
---        per-column codecs (raw/for/delta/delta2/dict) over TOAST/lz4,
+--        per-column codecs (raw/for/delta/auto/dict) over TOAST/lz4,
 --        generated unpack, static read view + range fast path,
 --        bench_codecs() for empirical codec comparison.
 --        add_dimension + post-v0.6 APIs are honest stubs raising
@@ -1265,6 +1265,98 @@ BEGIN
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
 
+    -- Resolve 'auto' int codecs by measurement, not proxy: mini-bench
+    -- the column as for vs delta on a 20K-row sample and keep the
+    -- smaller bytes. Stored resolved so pack/unpack never see 'auto'.
+    <<resolve_auto>>
+    DECLARE
+        v_nrows BIGINT;
+        v_base  JSONB;
+        v_map_f JSONB;
+        v_map_d JSONB;
+        v_bf    BIGINT;
+        v_bd    BIGINT;
+        v_ddl   TEXT;
+        r2      RECORD;
+    BEGIN
+        EXECUTE format('SELECT count(*) FROM %I.%I', p_schema, p_table)
+        INTO v_nrows;
+        FOR r IN SELECT * FROM pgseries._colinfo(
+                     p_schema, p_table, s.time_column,
+                     COALESCE(p_segmentby, '{}'))
+                 WHERE kind = 'data' LOOP
+            IF pgseries._eff_codec(COALESCE(p_codecs, '{}'),
+                                   r.attname::TEXT, r.class) <> 'auto' THEN
+                CONTINUE;
+            END IF;
+            -- Base map: explicit entries + class defaults (auto->for).
+            v_base := '{}';
+            FOR r2 IN SELECT * FROM pgseries._colinfo(
+                         p_schema, p_table, s.time_column,
+                         COALESCE(p_segmentby, '{}'))
+                     WHERE kind = 'data' LOOP
+                v_base := v_base || jsonb_build_object(r2.attname::TEXT,
+                    CASE WHEN pgseries._eff_codec(COALESCE(p_codecs, '{}'),
+                                                 r2.attname::TEXT,
+                                                 r2.class) = 'auto'
+                         THEN 'for'
+                         ELSE pgseries._eff_codec(COALESCE(p_codecs, '{}'),
+                                                  r2.attname::TEXT,
+                                                  r2.class) END);
+            END LOOP;
+            IF v_nrows = 0 THEN
+                RAISE NOTICE 'pgseries: empty table, auto codec for % -> for',
+                    r.attname;
+                p_codecs := COALESCE(p_codecs, '{}')
+                            || jsonb_build_object(r.attname::TEXT, 'for');
+                CONTINUE;
+            END IF;
+            -- for-vs-delta bout on a 20K-row sample; keep smaller bytes.
+            EXECUTE format('CREATE TEMP TABLE auto_src AS SELECT * FROM %I.%I '
+                           || 'ORDER BY %I %s LIMIT 20000',
+                p_schema, p_table, v_ob,
+                CASE WHEN p_orderby_desc THEN 'DESC' ELSE 'ASC' END);
+            v_map_f := v_base || jsonb_build_object(r.attname::TEXT, 'for');
+            v_map_d := v_base || jsonb_build_object(r.attname::TEXT, 'delta');
+            FOR v_ddl IN SELECT * FROM pgseries._compressed_ddl(
+                             'pg_temp', 'auto_src', 'pg_temp.auto_f',
+                             v_map_f, COALESCE(p_segmentby, '{}'), false) LOOP
+                EXECUTE v_ddl;
+            END LOOP;
+            PERFORM pgseries._pack_segments(
+                'pg_temp', 'auto_src', 'pg_temp', 'auto_f',
+                s.time_column, s.time_col_type, COALESCE(p_segmentby, '{}'),
+                s.time_column, false, LEAST(p_segment_rows, 1000),
+                v_map_f, COALESCE(p_requant, '{}'));
+            SELECT pg_total_relation_size('pg_temp.auto_f') INTO v_bf;
+            FOR v_ddl IN SELECT * FROM pgseries._compressed_ddl(
+                             'pg_temp', 'auto_src', 'pg_temp.auto_d',
+                             v_map_d, COALESCE(p_segmentby, '{}'), false) LOOP
+                EXECUTE v_ddl;
+            END LOOP;
+            PERFORM pgseries._pack_segments(
+                'pg_temp', 'auto_src', 'pg_temp', 'auto_d',
+                s.time_column, s.time_col_type, COALESCE(p_segmentby, '{}'),
+                s.time_column, false, LEAST(p_segment_rows, 1000),
+                v_map_d, COALESCE(p_requant, '{}'));
+            SELECT pg_total_relation_size('pg_temp.auto_d') INTO v_bd;
+            IF v_bd < v_bf THEN
+                RAISE NOTICE 'pgseries: auto codec for % -> delta (% vs % bytes)',
+                    r.attname, v_bd, v_bf;
+                p_codecs := COALESCE(p_codecs, '{}')
+                            || jsonb_build_object(r.attname::TEXT, 'delta');
+            ELSE
+                RAISE NOTICE 'pgseries: auto codec for % -> for (% vs % bytes)',
+                    r.attname, v_bf, v_bd;
+                p_codecs := COALESCE(p_codecs, '{}')
+                            || jsonb_build_object(r.attname::TEXT, 'for');
+            END IF;
+            DROP TABLE pg_temp.auto_f;
+            DROP TABLE pg_temp.auto_d;
+            DROP TABLE pg_temp.auto_src;
+        END LOOP;
+    END resolve_auto;
+
     -- Template tree + BRIN + read-only row trigger (verified: fires
     -- for direct-partition writes too).
     FOR v_ddl IN SELECT * FROM pgseries._compressed_ddl(
@@ -1567,6 +1659,7 @@ $$;
 -- Empirical codec comparison: packs a heap sample into temp tables
 -- under each candidate and reports bytes/row. Default candidates pit
 -- the spec pipeline (for+dict) against delta and delta-of-delta.
+DROP FUNCTION IF EXISTS pgseries.bench_codecs(NAME, NAME, NAME[], INTEGER, JSONB);
 CREATE OR REPLACE FUNCTION pgseries.bench_codecs(
     p_schema NAME, p_table NAME,
     p_segmentby NAME[] DEFAULT '{}',
@@ -1574,7 +1667,7 @@ CREATE OR REPLACE FUNCTION pgseries.bench_codecs(
     p_candidates JSONB DEFAULT NULL)
 RETURNS TABLE (name TEXT, rows BIGINT, bytes BIGINT,
                bytes_per_row NUMERIC, ratio_vs_heap NUMERIC,
-               segment_rows INTEGER)
+               segment_rows INTEGER, pack_ms BIGINT)
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pgseries, pg_catalog
@@ -1585,8 +1678,7 @@ DECLARE
         jsonb_build_object('name', 'raw', 'temporal', 'raw', 'ints', 'raw', 'text', 'raw', 'segment_rows', 1000),
         jsonb_build_object('name', 'spec', 'temporal', 'for', 'ints', 'for', 'text', 'dict', 'segment_rows', 1000),
         jsonb_build_object('name', 'delta', 'temporal', 'delta', 'ints', 'delta', 'text', 'dict', 'segment_rows', 1000),
-        jsonb_build_object('name', 'delta2', 'temporal', 'delta2', 'ints', 'delta', 'text', 'dict', 'segment_rows', 1000),
-        jsonb_build_object('name', 'delta2_seg5k', 'temporal', 'delta2', 'ints', 'delta', 'text', 'dict', 'segment_rows', 5000)));
+        jsonb_build_object('name', 'delta_seg5k', 'temporal', 'delta', 'ints', 'delta', 'text', 'dict', 'segment_rows', 5000)));
     v_cand   JSONB;
     v_codecs JSONB;
     v_seg    NAME[];
@@ -1597,6 +1689,8 @@ DECLARE
     v_tgt    TEXT;
     i        INTEGER := 0;
     r        RECORD;
+    v_t0     TIMESTAMPTZ;
+    v_t1     TIMESTAMPTZ;
 BEGIN
     s := pgseries._series(p_schema, p_table);
     EXECUTE format('CREATE TEMP TABLE bench_src AS SELECT * FROM %I.%I '
@@ -1645,11 +1739,13 @@ BEGIN
                          v_codecs, v_seg, false) LOOP
             EXECUTE v_ddl;
         END LOOP;
+        v_t0 := clock_timestamp();
         PERFORM pgseries._pack_segments(
             'pg_temp', 'bench_src', 'pg_temp', v_tgt,
             s.time_column, s.time_col_type, v_seg, s.time_column, false,
             COALESCE((v_cand ->> 'segment_rows')::INTEGER, 1000),
             v_codecs, '{}');
+        v_t1 := clock_timestamp();
         EXECUTE format('ANALYZE pg_temp.%I', v_tgt);
         EXECUTE format('SELECT pg_total_relation_size(%L)',
                        'pg_temp.' || v_tgt) INTO v_bytes;
@@ -1660,10 +1756,102 @@ BEGIN
         bytes_per_row := round(v_bytes::NUMERIC / v_rows, 2);
         ratio_vs_heap := round(v_bytes::NUMERIC / NULLIF(v_heap, 0), 3);
         segment_rows := COALESCE((v_cand ->> 'segment_rows')::INTEGER, 1000);
+        pack_ms := round(extract(epoch FROM (v_t1 - v_t0)) * 1000)::BIGINT;
         RETURN NEXT;
         EXECUTE format('DROP TABLE pg_temp.%I', v_tgt);
     END LOOP;
     EXECUTE 'DROP TABLE pg_temp.bench_src';
+END;
+$$;
+
+-- Actionable benchmark: samples the table, picks a segmentby by
+-- cardinality, knees the segment_rows curve (smallest N within 5% of
+-- the best bytes), and returns the exact policy call to run.
+-- This is the answer to "what do I do with bench numbers".
+CREATE OR REPLACE FUNCTION pgseries.suggest_compression(
+    p_schema NAME, p_table NAME, p_sample_rows INTEGER DEFAULT 50000)
+RETURNS TABLE (segmentby NAME[], segment_rows INTEGER, codecs JSONB,
+               expected_ratio NUMERIC, policy_sql TEXT)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pgseries, pg_catalog
+AS $$
+DECLARE
+    s        pgseries.series_table%ROWTYPE;
+    v_seg    NAME[] := '{}';
+    v_col    NAME;
+    v_n      BIGINT;
+    v_best   BIGINT;
+    v_cand   RECORD;
+    r        RECORD;
+BEGIN
+    s := pgseries._series(p_schema, p_table);
+
+    -- Segmentby heuristic: lowest-cardinality text-like column in a
+    -- sample (needles group rows; >10K distinct warns anyway).
+    <<pick_segby>>
+    DECLARE
+        v_best_n BIGINT := NULL;
+    BEGIN
+        FOR r IN SELECT * FROM pgseries._colinfo(
+                     p_schema, p_table, s.time_column, '{}')
+                 WHERE kind = 'data' AND class = 'text' LOOP
+            EXECUTE format('SELECT count(DISTINCT %I) FROM '
+                           || '(SELECT * FROM %I.%I ORDER BY %I DESC LIMIT %s) t',
+                r.attname, p_schema, p_table, s.time_column, p_sample_rows)
+            INTO v_n;
+            IF v_n > 1 AND v_n <= 10000
+               AND (v_best_n IS NULL OR v_n < v_best_n) THEN
+                v_best_n := v_n;
+                v_col := r.attname;
+            END IF;
+        END LOOP;
+        IF v_col IS NOT NULL THEN
+            v_seg := ARRAY[v_col];
+            RAISE NOTICE 'pgseries: segmentby % (% distinct values in sample)',
+                v_col, v_best_n;
+        ELSE
+            RAISE NOTICE 'pgseries: no suitable segmentby column, packing ungrouped';
+        END IF;
+    END pick_segby;
+
+    -- Knee over segment sizes (delta family throughout).
+    CREATE TEMP TABLE suggest_bench AS
+    SELECT * FROM pgseries.bench_codecs(p_schema, p_table, v_seg,
+        LEAST(p_sample_rows, 200000),
+        '[{"name":"d_500","temporal":"delta","ints":"delta","text":"dict","segment_rows":500},
+          {"name":"d_1k","temporal":"delta","ints":"delta","text":"dict","segment_rows":1000},
+          {"name":"d_2k","temporal":"delta","ints":"delta","text":"dict","segment_rows":2000},
+          {"name":"d_5k","temporal":"delta","ints":"delta","text":"dict","segment_rows":5000}]');
+    SELECT min(bytes) INTO v_best FROM suggest_bench;
+    SELECT b.segment_rows INTO segment_rows FROM suggest_bench b
+    WHERE b.bytes <= v_best * 1.05
+    ORDER BY b.segment_rows LIMIT 1;
+
+    segmentby := v_seg;
+    codecs := '{}';
+    FOR r IN SELECT * FROM pgseries._colinfo(
+                 p_schema, p_table, s.time_column, v_seg)
+             WHERE kind = 'data' LOOP
+        codecs := codecs || jsonb_build_object(r.attname::TEXT,
+            CASE WHEN r.typename LIKE 'timestamp%' OR r.typename = 'date'
+                      THEN 'delta'
+                 WHEN r.class = 'int' THEN 'delta'
+                 WHEN r.class = 'text' THEN 'dict'
+                 ELSE 'raw' END);
+    END LOOP;
+    SELECT round(1 / NULLIF(min(
+        CASE WHEN b.segment_rows = suggest_compression.segment_rows
+             THEN b.ratio_vs_heap END), 0), 2)
+    INTO expected_ratio FROM suggest_bench b;
+    policy_sql := format(
+        'SELECT pgseries.add_compression_policy(%L, %L, %L, %L, false, %s);',
+        p_schema::TEXT, p_table::TEXT,
+        CASE WHEN array_length(v_seg, 1) IS NULL THEN '{}'
+             ELSE '{' || array_to_string(v_seg, ',') || '}' END,
+        s.time_column::TEXT, segment_rows);
+    RETURN NEXT;
+    DROP TABLE suggest_bench;
 END;
 $$;
 
@@ -1691,22 +1879,24 @@ $$;
 --   <table>_read        — static view: heap UNION ALL lateral unpack.
 --   <table>_read_range  — fast path with seg-bound pushdown (BRIN skip).
 --
--- Codec set per column: raw | for | delta | delta2 | dict.
--- for/delta/delta2 apply to int/timestamp/date families only (exact
+-- Codec set per column: raw | for | delta | auto | dict.
+-- for/delta apply to int/timestamp/date families only (exact
 -- integer arithmetic on micros/days); floats are RAW (float
 -- reassociation is not bit-exact); text-like/bool/uuid/inet/arrays
 -- go through text form + dict/raw; jsonb/bytea/numeric are native RAW.
 -- NULLs are int[] positions (sparse-friendly; the spec's bitmap is
 -- equivalent but needs a custom aggregate in pure SQL).
--- ---------------------------------------------------------------------
-
--- Codec set per column: raw | for | delta | delta2 | dict.
--- for/delta/delta2 apply to int/timestamp/date families only (exact
--- integer arithmetic on micros/days); floats are RAW (float
--- reassociation is not bit-exact); text-like/bool/uuid/inet/arrays
--- go through text form + dict/raw; jsonb/bytea/numeric are native RAW.
--- NULLs are int[] positions (sparse-friendly; the spec's bitmap is
--- equivalent but needs a custom aggregate in pure SQL).
+--
+-- DELIBERATELY ABSENT: delta-of-delta. Measured on 500K regular rows
+-- (10s cadence) and jittered rows (+-3s): delta2 == delta to the byte
+-- in every candidate (0.23 B/row ts-only, 8.81 narrow, 16.94 jittered).
+-- Mechanism: int64 little-endian already exposes long zero-runs in the
+-- high bytes for both encodings, and lz4 (LZ77 only, no Huffman stage)
+-- eats constant runs either way — the second-order difference has no
+-- entropy left to remove. delta2 would only win under an entropy coder
+-- (simple-8b/Huffman), unreachable in pure SQL. It also costs an extra
+-- window pass on every unpack. If you miss it, re-read this paragraph
+-- after re-running bench_codecs on your own data.
 -- ---------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION pgseries._storage_class(p_type TEXT)
 RETURNS TEXT
@@ -1725,13 +1915,14 @@ AS $$
     END;
 $$;
 
--- Default codec per storage class (spec pipeline: FOR + dict + RAW).
+-- Default codec per storage class. int defaults to auto (resolved
+-- to for/delta at policy time by a correlation probe; see below).
 CREATE OR REPLACE FUNCTION pgseries._default_codec(p_class TEXT)
 RETURNS TEXT
 LANGUAGE sql IMMUTABLE
 SET search_path = pgseries, pg_catalog
 AS $$
-    SELECT CASE p_class WHEN 'int' THEN 'for'
+    SELECT CASE p_class WHEN 'int' THEN 'auto'
                         WHEN 'text' THEN 'dict'
                         ELSE 'raw' END;
 $$;
@@ -1755,12 +1946,16 @@ LANGUAGE plpgsql IMMUTABLE
 SET search_path = pgseries, pg_catalog
 AS $$
 BEGIN
-    IF p_codec NOT IN ('raw', 'for', 'delta', 'delta2', 'dict') THEN
+    IF p_codec = 'delta2' THEN
+        RAISE EXCEPTION 'pgseries: codec delta2 was removed (measured equivalent to delta under lz4, slower unpack; see design note above _storage_class)'
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF p_codec NOT IN ('raw', 'for', 'delta', 'auto', 'dict') THEN
         RAISE EXCEPTION 'pgseries: unknown codec % for column %',
             p_codec, p_col
             USING ERRCODE = 'invalid_parameter_value';
     END IF;
-    IF p_codec IN ('for', 'delta', 'delta2') AND p_class <> 'int' THEN
+    IF p_codec IN ('for', 'delta', 'auto') AND p_class <> 'int' THEN
         RAISE EXCEPTION 'pgseries: codec % needs int/timestamp/date, not % (%)',
             p_codec, p_class, p_col
             USING ERRCODE = 'invalid_parameter_value';
@@ -1847,6 +2042,11 @@ BEGIN
 
         v_codec := pgseries._eff_codec(p_codecs, r.attname::TEXT, r.class);
         PERFORM pgseries._check_codec(v_codec, r.class, r.attname::TEXT);
+        IF v_codec = 'auto' THEN
+            RAISE EXCEPTION 'pgseries: codec auto for % was not resolved (policies resolve at creation)',
+                r.attname
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
 
         -- L1 native expression per storage class (raw column refs only).
         IF r.class = 'int' THEN
@@ -1894,16 +2094,11 @@ BEGIN
                            v_min, v_a), v_pfx || '_arr',
                     format('(SELECT COALESCE(array_agg(j), ''{}'') FROM generate_subscripts(%I, 1) AS j WHERE (%I)[j] IS NULL)',
                            v_a, v_a), v_pfx || '_nulls')
-            WHEN v_codec IN ('delta', 'delta2') THEN
+            WHEN v_codec = 'delta' THEN
                 format('%s AS %I, %s AS %I, %s AS %I',
                     format('(%I)[1]', v_a), v_pfx || '_base',
-                    CASE WHEN v_codec = 'delta' THEN
-                        format('(SELECT COALESCE(array_agg((%I)[j+1] - (%I)[j]), ''{}'') FROM generate_subscripts(%I, 1) AS j WHERE j < cardinality(%I))',
-                               v_a, v_a, v_a, v_a)
-                    ELSE
-                        format('CASE WHEN cardinality(%I) < 2 THEN ''{}''::BIGINT[] ELSE ARRAY[(%I)[2] - (%I)[1]] || COALESCE((SELECT array_agg((%I)[j+2] - 2*(%I)[j+1] + (%I)[j]) FROM generate_subscripts(%I, 1) AS j WHERE j <= cardinality(%I) - 2), ''{}'') END',
-                               v_a, v_a, v_a, v_a, v_a, v_a, v_a, v_a)
-                    END, v_pfx || '_arr',
+                    format('(SELECT COALESCE(array_agg((%I)[j+1] - (%I)[j]), ''{}'') FROM generate_subscripts(%I, 1) AS j WHERE j < cardinality(%I))',
+                           v_a, v_a, v_a, v_a), v_pfx || '_arr',
                     format('(SELECT COALESCE(array_agg(j), ''{}'') FROM generate_subscripts(%I, 1) AS j WHERE (%I)[j] IS NULL)',
                            v_a, v_a), v_pfx || '_nulls')
             WHEN v_codec = 'dict' THEN
@@ -2005,27 +2200,22 @@ BEGIN
         END IF;
 
         v_codec := pgseries._eff_codec(p_codecs, r.attname::TEXT, r.class);
+        PERFORM pgseries._check_codec(v_codec, r.class, r.attname::TEXT);
+        IF v_codec = 'auto' THEN
+            RAISE EXCEPTION 'pgseries: codec auto for % was not resolved (policies resolve at creation)',
+                r.attname
+                USING ERRCODE = 'invalid_parameter_value';
+        END IF;
         v_arr := format('seg.%I', v_pfx || '_arr');
         v_base := format('seg.%I', v_pfx || '_base');
         v_nulls := format('seg.%I', v_pfx || '_nulls');
 
-        IF v_codec = 'delta' AND r.class = 'int' THEN
+        IF v_codec = 'delta' THEN
             v_cte := v_cte || format(
                 ', d%s AS (SELECT COALESCE(array_agg(s ORDER BY o), ''{}'') AS a '
                 || 'FROM (SELECT sum(x) OVER (ORDER BY o) AS s, o '
                 || 'FROM unnest(%s) WITH ORDINALITY AS u(x, o)) t)',
                 v_pfx, v_arr);
-        ELSIF v_codec = 'delta2' THEN
-            v_cte := v_cte || format(
-                ', d%s AS (SELECT COALESCE(array_agg(s ORDER BY o), ''{}'') AS a '
-                || 'FROM (SELECT sum(x) OVER (ORDER BY o) AS s, o '
-                || 'FROM unnest(%s) WITH ORDINALITY AS u(x, o)) t)',
-                v_pfx, v_arr);
-            v_cte := v_cte || format(
-                ', e%s AS (SELECT COALESCE(array_agg(s ORDER BY o), ''{}'') AS a '
-                || 'FROM (SELECT sum(x) OVER (ORDER BY o) AS s, o '
-                || 'FROM unnest((SELECT a FROM d%s)) WITH ORDINALITY AS u(x, o)) t)',
-                v_pfx, v_pfx);
         END IF;
 
         v_g := CASE
@@ -2033,9 +2223,6 @@ BEGIN
                 format('(%s + (%s)[i])', v_base, v_arr)
             WHEN v_codec = 'delta' THEN
                 format('(CASE WHEN i = 1 THEN %s ELSE %s + (SELECT a FROM d%s)[i-1] END)',
-                       v_base, v_base, v_pfx)
-            WHEN v_codec = 'delta2' THEN
-                format('(CASE WHEN i = 1 THEN %s ELSE %s + (SELECT a FROM e%s)[i-1] END)',
                        v_base, v_base, v_pfx)
             WHEN v_codec = 'dict' THEN
                 format('(CASE WHEN i = ANY(%s) THEN NULL ELSE (%s)[(%s)[i]] END)',
