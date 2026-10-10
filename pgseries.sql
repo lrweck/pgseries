@@ -1480,10 +1480,18 @@ BEGIN
     -- <table>_read / _read_range bound to the table rowtype; the new
     -- definitions bind to the view rowtype, so drop first (recreated
     -- below — data untouched).
-    EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table || '_read');
-    EXECUTE format('DROP FUNCTION IF EXISTS %I.%I(%s, %s)',
-                   p_schema, p_table || '_read_range',
-                   s.time_col_type, s.time_col_type);
+    IF to_regclass(format('%I.%I', p_schema, p_table || '_read')) IS NOT NULL THEN
+        EXECUTE format('DROP VIEW %I.%I', p_schema, p_table || '_read');
+    END IF;
+    -- Upgrade path: a pre-transparency _read_range is bound to the
+    -- table rowtype and would block the view-bound replacement.
+    IF to_regprocedure(format('%I.%I(%s, %s)', p_schema,
+                              p_table || '_read_range',
+                              s.time_col_type, s.time_col_type)) IS NOT NULL THEN
+        EXECUTE format('DROP FUNCTION %I.%I(%s, %s)',
+                       p_schema, p_table || '_read_range',
+                       s.time_col_type, s.time_col_type);
+    END IF;
     EXECUTE format('ALTER TABLE %I.%I RENAME TO %I',
                    p_schema, p_table, v_heap);
     -- Views first: the INSTEAD OF triggers require the base view.
