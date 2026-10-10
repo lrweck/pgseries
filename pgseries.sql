@@ -12,8 +12,10 @@
 --        stand-in with the same per-job advisory-lock contract.
 --        v0.6 (columnar compression) implemented in pure SQL: pluggable
 --        per-column codecs (raw/for/delta/auto/dict) over TOAST/lz4,
---        generated unpack, static read view + range fast path,
---        bench_codecs() for empirical codec comparison.
+--        generated unpack, transparent base-table reads (UNION view +
+--        INSTEAD OF DML), set-based multi-chunk packing via
+--        compress_table(), range fast path, bench_codecs() for
+--        empirical codec comparison.
 --        add_dimension + post-v0.6 APIs are honest stubs raising
 --        SQLSTATE 0A000 (feature_not_supported).
 --
@@ -21,7 +23,14 @@
 --   * compressed siblings live in a sibling partition tree
 --     (<table>_compressed), NOT attached as partitions of the series
 --     table — partitions require identical rowtypes. Heap stays
---     attached+empty as staging; reads via <table>_read / _read_range.
+--     attached+empty as staging; the BASE TABLE NAME becomes a UNION
+--     view at add_compression_policy time (the spec's
+--     `create view <table>`), with the heap renamed to <table>_heap.
+--     Bulk ingest (COPY) and internal movers address <table>_heap
+--     directly: INSTEAD OF row triggers cost ~11x per row (measured:
+--     COPY 200K rows 1.01s via view vs 0.09s heap-direct), so the hot
+--     path never goes through them. TRUNCATE must also address the
+--     heap (PG forbids TRUNCATE triggers on views).
 --   * NULLs stored as int[] positions, not bitmaps (set-based pack;
 --     sparse-friendly).
 --   * floats are RAW only (float reassociation is not bit-exact);
@@ -230,17 +239,19 @@ CREATE OR REPLACE FUNCTION pgseries._copy_columns(
 LANGUAGE plpgsql STABLE
 SET search_path = pgseries, pg_catalog
 AS $$
+DECLARE
+    v_rel TEXT := pgseries._write_parent(p_schema, p_table);
 BEGIN
     SELECT string_agg(quote_ident(attname), ', ' ORDER BY attnum)
     INTO v_all
     FROM pg_attribute
-    WHERE attrelid = to_regclass(format('%I.%I', p_schema, p_table))
+    WHERE attrelid = to_regclass(v_rel)
       AND attnum > 0 AND NOT attisdropped AND attgenerated = '';
 
     SELECT COALESCE(array_agg(attname ORDER BY attnum), '{}')
     INTO v_identities
     FROM pg_attribute
-    WHERE attrelid = to_regclass(format('%I.%I', p_schema, p_table))
+    WHERE attrelid = to_regclass(v_rel)
       AND attnum > 0 AND NOT attisdropped AND attidentity <> '';
 END;
 $$;
@@ -252,6 +263,42 @@ LANGUAGE sql IMMUTABLE
 SET search_path = pgseries, pg_catalog
 AS $$
     SELECT (p_table::TEXT || '_default')::NAME;
+$$;
+
+-- Write-parent resolution. Before any compression policy exists the
+-- series table is a plain partitioned table and writes target it
+-- directly. add_compression_policy renames it to <table>_heap and
+-- installs a transparent UNION view under the base name; from then on
+-- all internal DML/DDL must address the heap explicitly (the view's
+-- INSTEAD OF triggers are user-convenience only — measured ~11x per
+-- row — so bulk paths never go through them).
+CREATE OR REPLACE FUNCTION pgseries._heap_name(p_table NAME)
+RETURNS NAME
+LANGUAGE sql IMMUTABLE
+SET search_path = pgseries, pg_catalog
+AS $$
+    SELECT (p_table::TEXT || '_heap')::NAME;
+$$;
+
+CREATE OR REPLACE FUNCTION pgseries._is_transparent(p_schema NAME, p_table NAME)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE
+SET search_path = pgseries, pg_catalog
+AS $$
+    SELECT to_regclass(format('%I.%I', p_schema,
+        pgseries._heap_name(p_table))) IS NOT NULL;
+$$;
+
+-- Qualified write target: heap when the transparent view is installed,
+-- else the base table itself.
+CREATE OR REPLACE FUNCTION pgseries._write_parent(p_schema NAME, p_table NAME)
+RETURNS TEXT
+LANGUAGE sql STABLE
+SET search_path = pgseries, pg_catalog
+AS $$
+    SELECT CASE WHEN pgseries._is_transparent(p_schema, p_table)
+                THEN format('%I.%I', p_schema, pgseries._heap_name(p_table))
+                ELSE format('%I.%I', p_schema, p_table) END;
 $$;
 
 -- FSM-enforcing lease transition. Raises on any undocumented edge.
@@ -318,6 +365,7 @@ DECLARE
     v_existing TIMESTAMPTZ;
     v_cols     TEXT;
     v_c        NAME;
+    v_wp       TEXT := pgseries._write_parent(p_schema, p_table);
 BEGIN
     s := pgseries._series(p_schema, p_table);
 
@@ -342,17 +390,17 @@ BEGIN
     END IF;
 
     EXECUTE format(
-        'CREATE TABLE %I.%I (LIKE %I.%I '
+        'CREATE TABLE %I.%I (LIKE %s '
         || 'INCLUDING DEFAULTS INCLUDING CONSTRAINTS '
         || 'INCLUDING GENERATED INCLUDING IDENTITY)',
-        p_schema, v_chunk, p_schema, p_table);
+        p_schema, v_chunk, v_wp);
 
     -- Leaves may not own identity columns (verified): the parent's
     -- shared identity governs. Generated columns must stay (verified:
     -- ATTACH demands them). Drop only the identity property.
     FOR v_c IN
         SELECT a.attname FROM pg_attribute a
-        WHERE a.attrelid = to_regclass(format('%I.%I', p_schema, p_table))
+        WHERE a.attrelid = to_regclass(v_wp)
           AND a.attidentity <> ''
     LOOP
         EXECUTE format('ALTER TABLE %I.%I ALTER COLUMN %I DROP IDENTITY',
@@ -376,9 +424,9 @@ BEGIN
 
     -- Bounds as typed literals of the real partition-key type.
     EXECUTE format(
-        'ALTER TABLE %I.%I ATTACH PARTITION %I.%I '
+        'ALTER TABLE %s ATTACH PARTITION %I.%I '
         || 'FOR VALUES FROM (%L::%s) TO (%L::%s)',
-        p_schema, p_table, p_schema, v_chunk,
+        v_wp, p_schema, v_chunk,
         p_lower::TEXT, s.time_col_type,
         p_upper::TEXT, s.time_col_type);
 
@@ -805,9 +853,11 @@ DECLARE
     v_days     INTEGER;
     v_origin_d DATE;
     v_cols     TEXT;
+    v_wp       TEXT;
 BEGIN
     s := pgseries._series(p_schema, p_table);
     PERFORM pgseries._table_lock(p_schema, p_table);
+    v_wp := pgseries._write_parent(p_schema, p_table);
     v_default := pgseries._default_name(p_table);
     SELECT c.v_all INTO v_cols
     FROM pgseries._copy_columns(p_schema, p_table) AS c;
@@ -819,6 +869,11 @@ BEGIN
             v_nulls, p_schema, v_default;
     END IF;
 
+    -- Set-based data move: one grouping scan finds every missing bucket,
+    -- _create_chunk drains each bucket pre-ATTACH (its own DELETE+INSERT,
+    -- required so the ATTACH validation scan passes), then a SINGLE
+    -- sweep relocates whatever arrived concurrently mid-operation.
+    -- Previously the sweep was per-bucket (2N statements, N scans).
     -- DATE keys: group in date space so buckets match the partition
     -- bounds exactly (see _date_bucket).
     IF s.time_col_type = 'date' THEN
@@ -833,18 +888,16 @@ BEGIN
             PERFORM pgseries._create_chunk(
                 p_schema, p_table,
                 r.b::TIMESTAMPTZ, (r.b + v_days)::TIMESTAMPTZ);
-            EXECUTE format(
-                'WITH moved AS (DELETE FROM %I.%I '
-                || 'WHERE %I >= %L::DATE AND %I < %L::DATE RETURNING *) '
-                || 'INSERT INTO %I.%I (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM moved',
-                p_schema, v_default,
-                s.time_column, r.b::TEXT,
-                s.time_column, (r.b + v_days)::TEXT,
-                p_schema, p_table, v_cols, v_cols);
-            GET DIAGNOSTICS v_moved = ROW_COUNT;
-            v_total := v_total + r.n + v_moved;
+            v_total := v_total + r.n;
         END LOOP;
-        RETURN v_total;
+        EXECUTE format(
+            'WITH moved AS (DELETE FROM %I.%I '
+            || 'WHERE %I IS NOT NULL RETURNING *) '
+            || 'INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM moved',
+            p_schema, v_default, s.time_column,
+            v_wp, v_cols, v_cols);
+        GET DIAGNOSTICS v_moved = ROW_COUNT;
+        RETURN v_total + v_moved;
     END IF;
 
     FOR r IN EXECUTE format(
@@ -854,22 +907,19 @@ BEGIN
         p_schema, v_default, s.time_column)
     LOOP
         -- _create_chunk drains this bucket from DEFAULT into the new
-        -- table pre-ATTACH (r.n rows); the DELETE below only catches
-        -- rows that arrived concurrently after the grouping snapshot.
+        -- table pre-ATTACH (r.n rows).
         PERFORM pgseries._create_chunk(
             p_schema, p_table, r.b, r.b + s.chunk_interval);
-        EXECUTE format(
-            'WITH moved AS (DELETE FROM %I.%I '
-            || 'WHERE %I >= %L::%s AND %I < %L::%s RETURNING *) '
-            || 'INSERT INTO %I.%I (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM moved',
-            p_schema, v_default,
-            s.time_column, r.b::TEXT, s.time_col_type,
-            s.time_column, (r.b + s.chunk_interval)::TEXT, s.time_col_type,
-            p_schema, p_table, v_cols, v_cols);
-        GET DIAGNOSTICS v_moved = ROW_COUNT;
-        v_total := v_total + r.n + v_moved;
+        v_total := v_total + r.n;
     END LOOP;
-    RETURN v_total;
+    EXECUTE format(
+        'WITH moved AS (DELETE FROM %I.%I '
+        || 'WHERE %I IS NOT NULL RETURNING *) '
+        || 'INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM moved',
+        p_schema, v_default, s.time_column,
+        v_wp, v_cols, v_cols);
+    GET DIAGNOSTICS v_moved = ROW_COUNT;
+    RETURN v_total + v_moved;
 END;
 $$;
 
@@ -1173,6 +1223,217 @@ BEGIN
 END;
 $$;
 
+-- DML trigger bodies for the transparent base view. Generated per
+-- series table at swap time (column lists are static then). INSERT
+-- routes to the heap with generated-stored columns omitted and
+-- OVERRIDING SYSTEM VALUE so explicit identity values keep working
+-- (DEFAULT still generates). UPDATE/DELETE match heap rows on
+-- whole-row equality with OLD; when nothing matches, the row either
+-- never existed (standard 0-row no-op) or lives in the compressed
+-- store — the seg-range probe distinguishes and raises read-only.
+-- Identity and generated-stored columns are excluded from SET
+-- (GENERATED ALWAYS rejects updates); all columns participate in the
+-- match, floats included (RAW storage is bit-exact).
+CREATE OR REPLACE FUNCTION pgseries._write_trg_ddl(
+    p_schema NAME, p_table NAME)
+RETURNS SETOF TEXT
+LANGUAGE plpgsql STABLE
+SET search_path = pgseries, pg_catalog
+AS $$
+DECLARE
+    s        pgseries.series_table%ROWTYPE;
+    v_heap   TEXT := format('%I.%I', p_schema, pgseries._heap_name(p_table));
+    v_tpl    TEXT := format('%I.%I', p_schema, p_table || '_compressed');
+    v_unpack TEXT := 'pgseries.unpack_' || pgseries._slug(p_schema, p_table);
+    v_base   TEXT := format('%I.%I', p_schema, p_table);
+    v_fbase  TEXT := 'pgseries.write_' || pgseries._slug(p_schema, p_table);
+    v_ins    TEXT := '';
+    v_vals   TEXT := '';
+    v_set    TEXT := '';
+    v_match  TEXT := '';
+    v_first  BOOLEAN := true;
+    r        RECORD;
+    v_id     TEXT;
+    v_gen    TEXT;
+BEGIN
+    s := pgseries._series(p_schema, p_table);
+
+    FOR r IN SELECT * FROM pgseries._colinfo(
+                 p_schema, p_table, s.time_column, '{}') LOOP
+        IF r.kind <> 'gen' THEN
+            v_ins := v_ins || format(', %I', r.attname);
+            v_vals := v_vals || format(', NEW.%I', r.attname);
+        END IF;
+        -- Plain data columns are updatable; identity/generated match only.
+        SELECT attidentity, attgenerated INTO v_id, v_gen FROM pg_attribute
+        WHERE attrelid = to_regclass(v_heap)
+          AND attname = r.attname AND attnum > 0 AND NOT attisdropped;
+        IF FOUND AND v_id = '' AND v_gen = '' THEN
+            v_set := v_set || format(', %I = NEW.%I', r.attname, r.attname);
+        END IF;
+    END LOOP;
+    -- Whole-row match on every physical column (heap stores the
+    -- generated values too, so they participate here).
+    v_match := '';
+    FOR r IN SELECT quote_ident(attname) AS c FROM pg_attribute
+             WHERE attrelid = to_regclass(v_heap)
+               AND attnum > 0 AND NOT attisdropped
+             ORDER BY attnum LOOP
+        v_match := v_match || format(' AND h.%s IS NOT DISTINCT FROM OLD.%s',
+                                     r.c, r.c);
+    END LOOP;
+    v_match := substring(v_match from 6);
+    v_ins := substring(v_ins from 3);
+    v_vals := substring(v_vals from 3);
+    v_set := substring(v_set from 3);
+
+    RETURN NEXT format(
+        'CREATE OR REPLACE FUNCTION %s_ins() RETURNS trigger '
+        || 'LANGUAGE plpgsql SET search_path = pgseries, pg_catalog AS %s '
+        || 'DECLARE r %s%%ROWTYPE; BEGIN '
+        || 'INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE VALUES (%s) '
+        || 'RETURNING * INTO r; NEW := r; RETURN NEW; END %s',
+        v_fbase, '$pgseries_w$', v_heap, v_heap, v_ins, v_vals,
+        '$pgseries_w$');
+    RETURN NEXT format(
+        'CREATE OR REPLACE FUNCTION %s_upd() RETURNS trigger '
+        || 'LANGUAGE plpgsql SET search_path = pgseries, pg_catalog AS %s '
+        || 'DECLARE v_n BIGINT; v_hit BOOLEAN; BEGIN '
+        || 'UPDATE %s AS h SET %s WHERE %s; '
+        || 'GET DIAGNOSTICS v_n = ROW_COUNT; '
+        || 'IF v_n = 0 THEN '
+        || 'SELECT EXISTS (SELECT 1 FROM %s AS c '
+        || 'WHERE c.seg_max_ts >= (OLD.%I)::TIMESTAMPTZ '
+        || 'AND c.seg_min_ts <= (OLD.%I)::TIMESTAMPTZ '
+        || 'AND EXISTS (SELECT 1 FROM %s(c) AS u WHERE %s)) INTO v_hit; '
+        || 'IF v_hit THEN RAISE EXCEPTION %s USING ERRCODE = %s; END IF; '
+        || 'END IF; RETURN NEW; END %s',
+        v_fbase, '$pgseries_w$', v_heap, v_set, v_match,
+        v_tpl, s.time_column, s.time_column, v_unpack,
+        (SELECT string_agg(format('u.%I IS NOT DISTINCT FROM OLD.%I',
+                                  attname, attname), ' AND ')
+         FROM pgseries._colinfo(p_schema, p_table, s.time_column, '{}')
+         WHERE kind <> 'gen'),
+        quote_literal('pgseries: row lives in the compressed store '
+                      || '(read-only; decompress_chunk to write)'),
+        quote_literal('read_only_sql_transaction'),
+        '$pgseries_w$');
+    RETURN NEXT format(
+        'CREATE OR REPLACE FUNCTION %s_del() RETURNS trigger '
+        || 'LANGUAGE plpgsql SET search_path = pgseries, pg_catalog AS %s '
+        || 'DECLARE v_n BIGINT; v_hit BOOLEAN; BEGIN '
+        || 'DELETE FROM %s AS h WHERE %s; '
+        || 'GET DIAGNOSTICS v_n = ROW_COUNT; '
+        || 'IF v_n = 0 THEN '
+        || 'SELECT EXISTS (SELECT 1 FROM %s AS c '
+        || 'WHERE c.seg_max_ts >= (OLD.%I)::TIMESTAMPTZ '
+        || 'AND c.seg_min_ts <= (OLD.%I)::TIMESTAMPTZ '
+        || 'AND EXISTS (SELECT 1 FROM %s(c) AS u WHERE %s)) INTO v_hit; '
+        || 'IF v_hit THEN RAISE EXCEPTION %s USING ERRCODE = %s; END IF; '
+        || 'END IF; RETURN OLD; END %s',
+        v_fbase, '$pgseries_w$', v_heap, v_match,
+        v_tpl, s.time_column, s.time_column, v_unpack,
+        (SELECT string_agg(format('u.%I IS NOT DISTINCT FROM OLD.%I',
+                                  attname, attname), ' AND ')
+         FROM pgseries._colinfo(p_schema, p_table, s.time_column, '{}')
+         WHERE kind <> 'gen'),
+        quote_literal('pgseries: row lives in the compressed store '
+                      || '(read-only; decompress_chunk to write)'),
+        quote_literal('read_only_sql_transaction'),
+        '$pgseries_w$');
+    RETURN NEXT format(
+        'CREATE TRIGGER %I INSTEAD OF INSERT ON %s '
+        || 'FOR EACH ROW EXECUTE FUNCTION %s_ins()',
+        p_table::TEXT || '_w_ins', v_base, v_fbase);
+    RETURN NEXT format(
+        'CREATE TRIGGER %I INSTEAD OF UPDATE ON %s '
+        || 'FOR EACH ROW EXECUTE FUNCTION %s_upd()',
+        p_table::TEXT || '_w_upd', v_base, v_fbase);
+    RETURN NEXT format(
+        'CREATE TRIGGER %I INSTEAD OF DELETE ON %s '
+        || 'FOR EACH ROW EXECUTE FUNCTION %s_del()',
+        p_table::TEXT || '_w_del', v_base, v_fbase);
+END;
+$$;
+
+-- Swap the base table name to a transparent UNION view: rename the
+-- heap parent aside, install INSTEAD OF DML triggers + read views.
+-- Reads via the base name then include compressed rows; bulk ingest
+-- (COPY) and internal movers keep addressing <table>_heap directly.
+CREATE OR REPLACE FUNCTION pgseries._make_transparent(
+    p_schema NAME, p_table NAME)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pgseries, pg_catalog
+AS $$
+DECLARE
+    v_heap NAME := pgseries._heap_name(p_table);
+    v_ddl  TEXT;
+    s      pgseries.series_table%ROWTYPE;
+BEGIN
+    s := pgseries._series(p_schema, p_table);
+    IF to_regclass(format('%I.%I', p_schema, v_heap)) IS NOT NULL THEN
+        RAISE EXCEPTION 'pgseries: %.% already exists (name reserved for the heap)',
+            p_schema, v_heap
+            USING ERRCODE = 'duplicate_table';
+    END IF;
+    -- Upgrade path: an install predating transparency already owns
+    -- <table>_read / _read_range bound to the table rowtype; the new
+    -- definitions bind to the view rowtype, so drop first (recreated
+    -- below — data untouched).
+    EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table || '_read');
+    EXECUTE format('DROP FUNCTION IF EXISTS %I.%I(%s, %s)',
+                   p_schema, p_table || '_read_range',
+                   s.time_col_type, s.time_col_type);
+    EXECUTE format('ALTER TABLE %I.%I RENAME TO %I',
+                   p_schema, p_table, v_heap);
+    -- Views first: the INSTEAD OF triggers require the base view.
+    FOR v_ddl IN SELECT * FROM pgseries._read_ddl(p_schema, p_table) LOOP
+        EXECUTE v_ddl;
+    END LOOP;
+    FOR v_ddl IN SELECT * FROM pgseries._write_trg_ddl(p_schema, p_table) LOOP
+        EXECUTE v_ddl;
+    END LOOP;
+    EXECUTE format('GRANT SELECT ON %I.%I TO pgseries_reader',
+                   p_schema, p_table);
+    EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %I.%I '
+                   || 'TO pgseries_writer', p_schema, p_table);
+END;
+$$;
+
+-- Undo _make_transparent: drop the view (its INSTEAD OF triggers go
+-- with it), drop the generated functions/alias/range path, rename the
+-- heap back. The table is a plain partitioned table again.
+CREATE OR REPLACE FUNCTION pgseries._make_opaque(
+    p_schema NAME, p_table NAME)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pgseries, pg_catalog
+AS $$
+DECLARE
+    s      pgseries.series_table%ROWTYPE;
+    v_heap NAME := pgseries._heap_name(p_table);
+    v_slug TEXT := pgseries._slug(p_schema, p_table);
+BEGIN
+    s := pgseries._series(p_schema, p_table);
+    IF NOT pgseries._is_transparent(p_schema, p_table) THEN
+        RETURN;
+    END IF;
+    EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table || '_read');
+    EXECUTE format('DROP FUNCTION IF EXISTS %I.%I(%s, %s)',
+                   p_schema, p_table || '_read_range',
+                   s.time_col_type, s.time_col_type);
+    EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table);
+    EXECUTE format('DROP FUNCTION IF EXISTS %s_ins()', 'pgseries.write_' || v_slug);
+    EXECUTE format('DROP FUNCTION IF EXISTS %s_upd()', 'pgseries.write_' || v_slug);
+    EXECUTE format('DROP FUNCTION IF EXISTS %s_del()', 'pgseries.write_' || v_slug);
+    EXECUTE format('ALTER TABLE %I.%I RENAME TO %I',
+                   p_schema, v_heap, p_table);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION pgseries.add_compression_policy(
     p_schema NAME, p_table NAME,
     p_segmentby NAME[] DEFAULT '{}',
@@ -1403,13 +1664,13 @@ BEGIN
             p_orderby_desc, p_segment_rows,
             COALESCE(p_codecs, '{}'), COALESCE(p_requant, '{}'));
 
-    -- Generated read path: unpack + static view + range fast path.
+    -- Generated read path: unpack first (its SETOF return type binds
+    -- to the base OID pre-rename and follows it to the heap), then the
+    -- swap installs the transparent base view + DML triggers + alias.
     EXECUTE pgseries._unpack_ddl(p_schema, p_table,
                                  COALESCE(p_codecs, '{}'),
                                  COALESCE(p_segmentby, '{}'));
-    FOR v_ddl IN SELECT * FROM pgseries._read_ddl(p_schema, p_table) LOOP
-        EXECUTE v_ddl;
-    END LOOP;
+    PERFORM pgseries._make_transparent(p_schema, p_table);
 
     -- Cardinality trap (spec): segmentby near segments-per-chunk
     -- collapses the ratio. One-off scan at policy time.
@@ -1454,13 +1715,7 @@ BEGIN
             v_n
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
-    EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table || '_read');
-    EXECUTE format('DROP FUNCTION IF EXISTS %I.%I(%s, %s)',
-                   p_schema, p_table || '_read_range',
-                   (SELECT time_col_type FROM pgseries.series_table
-                    WHERE series_schema = p_schema AND series_table = p_table),
-                   (SELECT time_col_type FROM pgseries.series_table
-                    WHERE series_schema = p_schema AND series_table = p_table));
+    PERFORM pgseries._make_opaque(p_schema, p_table);
     EXECUTE format('DROP FUNCTION IF EXISTS pgseries.unpack_%s', v_slug);
     EXECUTE format('DROP TABLE IF EXISTS %I.%I',
                    p_schema, p_table || '_compressed');
@@ -1469,9 +1724,12 @@ BEGIN
 END;
 $$;
 
--- Static read path for a compressed table: full-union view plus a
--- range fast path whose seg-bound quals hit BRIN before the LATERAL
--- unnest fires (the spec's load-bearing plan shape).
+-- Transparent read path for a compressed table: the UNION view under
+-- the BASE name (the spec's `create view <table>`), a
+-- backwards-compatible <table>_read alias, and a range fast path whose
+-- seg-bound quals hit BRIN before the LATERAL unnest fires (the
+-- spec's load-bearing plan shape). Heap is addressed explicitly: bulk
+-- readers that want heap-only (movers, benchmarks) bypass the view.
 CREATE OR REPLACE FUNCTION pgseries._read_ddl(
     p_schema NAME, p_table NAME)
 RETURNS SETOF TEXT
@@ -1480,6 +1738,7 @@ SET search_path = pgseries, pg_catalog
 AS $$
 DECLARE
     s       pgseries.series_table%ROWTYPE;
+    v_heap  TEXT := format('%I.%I', p_schema, pgseries._heap_name(p_table));
     v_tpl   TEXT := format('%I.%I', p_schema, p_table || '_compressed');
     v_unpack TEXT := 'pgseries.unpack_' || pgseries._slug(p_schema, p_table);
     v_view  TEXT := format('%I.%I', p_schema, p_table || '_read');
@@ -1487,15 +1746,18 @@ DECLARE
 BEGIN
     s := pgseries._series(p_schema, p_table);
     RETURN NEXT
-        format('CREATE OR REPLACE VIEW %s AS SELECT * FROM %I.%I '
+        format('CREATE OR REPLACE VIEW %I.%I AS SELECT * FROM %s '
                || 'UNION ALL SELECT u.* FROM %s AS c, '
                || 'LATERAL %s(c) AS u',
-               v_view, p_schema, p_table, v_tpl, v_unpack);
+               p_schema, p_table, v_heap, v_tpl, v_unpack);
+    RETURN NEXT
+        format('CREATE OR REPLACE VIEW %s AS SELECT * FROM %I.%I',
+               v_view, p_schema, p_table);
     RETURN NEXT
         format('CREATE OR REPLACE FUNCTION %s(a %s, b %s) '
                || 'RETURNS SETOF %I.%I LANGUAGE sql STABLE '
                || 'SET search_path = pgseries, pg_catalog AS %s '
-               || 'SELECT * FROM %I.%I WHERE %I >= $1 AND %I <= $2 '
+               || 'SELECT * FROM %s WHERE %I >= $1 AND %I <= $2 '
                || 'UNION ALL '
                || 'SELECT u.* FROM (SELECT c.* FROM %s AS c '
                || 'WHERE c.seg_max_ts >= $1::TIMESTAMPTZ '
@@ -1504,7 +1766,7 @@ BEGIN
                v_range, s.time_col_type, s.time_col_type,
                p_schema, p_table,
                '$pgseries_read$',
-               p_schema, p_table, s.time_column, s.time_column,
+               v_heap, s.time_column, s.time_column,
                v_tpl, v_unpack, s.time_column, s.time_column, '$pgseries_read$');
 END;
 $$;
@@ -1616,6 +1878,177 @@ BEGIN
 
     RETURN format('compressed %s rows into %s segments (%I)',
                   v_heap, v_segs, v_cpart);
+END;
+$$;
+
+-- Set-based multi-chunk compression: packs every eligible ready chunk
+-- in ONE INSERT..SELECT over the heap parent (partition pruning limits
+-- the scan; the window resets per chunk bucket), then truncates the
+-- heaps and flips the leases. Cold chunks only by default
+-- (p_include_hot opts the live chunk in); p_older_than further
+-- restricts to chunks below a cutoff. Empty heaps are skipped via a
+-- single UNION ALL count probe — pre-created future chunks must never
+-- flip to compressed. Returns a human summary.
+CREATE OR REPLACE FUNCTION pgseries.compress_table(
+    p_schema NAME, p_table NAME,
+    p_older_than INTERVAL DEFAULT NULL,
+    p_include_hot BOOLEAN DEFAULT false)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pgseries, pg_catalog
+AS $$
+DECLARE
+    s        pgseries.series_table%ROWTYPE;
+    pol      pgseries.compression_policy%ROWTYPE;
+    v_heap   NAME := pgseries._heap_name(p_table);
+    v_tpl    TEXT := format('%I.%I', p_schema, p_table || '_compressed');
+    v_cutoff TIMESTAMPTZ;
+    v_nchunk INTEGER;
+    v_n      BIGINT;
+    v_nrows  BIGINT;
+    v_nsegs  BIGINT;
+    v_min    TIMESTAMPTZ;
+    v_max    TIMESTAMPTZ;
+    v_bucket TEXT;
+    v_where  TEXT;
+    v_sql    TEXT;
+    v_cpart  NAME;
+    r        RECORD;
+BEGIN
+    s := pgseries._series(p_schema, p_table);
+    SELECT * INTO pol FROM pgseries.compression_policy
+    WHERE series_schema = p_schema AND series_table = p_table;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pgseries: %.% has no compression policy',
+            p_schema, p_table
+            USING ERRCODE = 'undefined_object';
+    END IF;
+    IF NOT pgseries._is_transparent(p_schema, p_table) THEN
+        RAISE EXCEPTION 'pgseries: %.% is not transparent (add_compression_policy bug)',
+            p_schema, p_table
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    PERFORM pgseries._table_lock(p_schema, p_table);
+    v_cutoff := CASE WHEN p_older_than IS NULL THEN NULL
+                     ELSE now() - p_older_than END;
+
+    CREATE TEMP TABLE IF NOT EXISTS pgseries_compress_list (
+        cn NAME PRIMARY KEY,
+        lo TIMESTAMPTZ NOT NULL, hi TIMESTAMPTZ NOT NULL,
+        heap_n BIGINT NOT NULL DEFAULT -1) ON COMMIT DROP;
+    DELETE FROM pgseries_compress_list;
+    INSERT INTO pgseries_compress_list (cn, lo, hi)
+    SELECT c.chunk_name, c.range_lower, c.range_upper
+    FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id)
+    WHERE c.series_schema = p_schema AND c.series_table = p_table
+      AND l.state = 'ready'
+      AND c.range_lower IS NOT NULL
+      AND (v_cutoff IS NULL OR c.range_upper < v_cutoff)
+      AND (p_include_hot OR c.range_upper < now());
+
+    -- Single set-based emptiness probe (one UNION ALL, one EXECUTE).
+    SELECT string_agg(
+               format('SELECT %L::NAME AS cn, count(*) AS n FROM %I.%I',
+                      cn, p_schema, cn), ' UNION ALL ')
+    INTO v_sql FROM pgseries_compress_list;
+    IF v_sql IS NOT NULL THEN
+        EXECUTE 'WITH h AS (' || v_sql || ') '
+            || 'UPDATE pgseries_compress_list l SET heap_n = h.n '
+            || 'FROM h WHERE h.cn = l.cn';
+    END IF;
+    DELETE FROM pgseries_compress_list WHERE heap_n <= 0;
+    SELECT count(*) INTO v_nchunk FROM pgseries_compress_list;
+    IF v_nchunk = 0 THEN
+        RETURN 'nothing eligible to compress';
+    END IF;
+
+    -- Guarded set flip of the whole batch (no per-chunk transition
+    -- calls; concurrent modification aborts instead of half-packing).
+    UPDATE pgseries.chunk_lease l SET state = 'compressing', updated_at = now()
+    FROM pgseries.chunk c JOIN pgseries_compress_list t ON t.cn = c.chunk_name
+    WHERE l.chunk_id = c.chunk_id AND l.state = 'ready'
+      AND c.series_schema = p_schema AND c.series_table = p_table;
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    IF v_n <> v_nchunk THEN
+        RAISE EXCEPTION 'pgseries: %.% lost a chunk race (want %, flipped %)',
+            p_schema, p_table, v_nchunk, v_n
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    -- Compressed partitions up front (DDL per chunk; names only).
+    FOR r IN SELECT * FROM pgseries_compress_list ORDER BY lo LOOP
+        v_cpart := (r.cn::TEXT || '_compressed')::NAME;
+        IF to_regclass(format('%I.%I', p_schema, v_cpart)) IS NULL THEN
+            EXECUTE format('CREATE TABLE %I.%I PARTITION OF %s '
+                           || 'FOR VALUES FROM (%L::TIMESTAMPTZ) TO (%L::TIMESTAMPTZ)',
+                p_schema, v_cpart, v_tpl, r.lo::TEXT, r.hi::TEXT);
+            EXECUTE format('REVOKE ALL ON %I.%I FROM PUBLIC, pgseries_reader, pgseries_writer',
+                p_schema, v_cpart);
+            EXECUTE format('CREATE TRIGGER %I BEFORE TRUNCATE ON %I.%I '
+                           || 'FOR EACH STATEMENT EXECUTE FUNCTION '
+                           || 'pgseries._compressed_no_truncate()',
+                           v_cpart::TEXT || '_no_trunc', p_schema, v_cpart);
+        END IF;
+    END LOOP;
+
+    -- The bucket expression must reproduce partition bounds exactly
+    -- (same origin/interval math as precreate/move).
+    IF s.time_col_type = 'date' THEN
+        v_bucket := format('pgseries._date_bucket(%I, %L::DATE, %s)::TIMESTAMPTZ',
+            s.time_column, s.origin::DATE,
+            pgseries._interval_days(s.chunk_interval));
+    ELSE
+        v_bucket := format('date_bin(%L::INTERVAL, %I, %L::TIMESTAMPTZ)',
+            s.chunk_interval, s.time_column, s.origin);
+    END IF;
+    SELECT min(lo), max(hi) INTO v_min, v_max FROM pgseries_compress_list;
+    v_where := format('%I >= %L::TIMESTAMPTZ AND %I < %L::TIMESTAMPTZ AND (%s) IN (SELECT lo FROM pgseries_compress_list)',
+        s.time_column, v_min, s.time_column, v_max, v_bucket);
+
+    EXECUTE 'SET LOCAL pgseries.allow_compressed_write = ''on''';
+    SELECT pgseries._pack_segments(p_schema, v_heap, p_schema,
+        (p_table || '_compressed')::NAME,
+        s.time_column, s.time_col_type, pol.segmentby, pol.orderby,
+        pol.orderby_desc, pol.segment_rows, pol.codecs, pol.requant,
+        v_where, v_bucket)
+    INTO v_nsegs;
+
+    -- Heaps drained (one TRUNCATE per chunk; DDL, no scans), leases out.
+    FOR r IN SELECT * FROM pgseries_compress_list ORDER BY lo LOOP
+        EXECUTE format('TRUNCATE %I.%I', p_schema, r.cn);
+    END LOOP;
+    UPDATE pgseries.chunk_lease l SET state = 'compressed', updated_at = now()
+    FROM pgseries.chunk c JOIN pgseries_compress_list t ON t.cn = c.chunk_name
+    WHERE l.chunk_id = c.chunk_id AND l.state = 'compressing'
+      AND c.series_schema = p_schema AND c.series_table = p_table;
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    IF v_n <> v_nchunk THEN
+        RAISE EXCEPTION 'pgseries: %.% lost a chunk race on close (want %, flipped %)',
+            p_schema, p_table, v_nchunk, v_n
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    EXECUTE format('SELECT COALESCE(sum(seg_row_count), 0) FROM %s '
+                   || 'WHERE seg_min_ts >= %L::TIMESTAMPTZ '
+                   || 'AND seg_min_ts < %L::TIMESTAMPTZ',
+                   v_tpl, v_min, v_max) INTO v_nrows;
+    EXECUTE format('ANALYZE %s', v_tpl);
+    -- Per-partition BRINs summarized exactly (parent partitioned
+    -- indexes hold no storage themselves).
+    FOR r IN SELECT i.indexrelid
+             FROM pg_index i
+             JOIN pg_inherits h ON h.inhrelid = i.indrelid
+             WHERE h.inhparent = to_regclass(v_tpl) LOOP
+        BEGIN
+            PERFORM brin_summarize_new_values(r.indexrelid);
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+    END LOOP;
+
+    RETURN format('compressed %s chunks, %s rows into %s segments',
+                  v_nchunk, v_nrows, v_nsegs);
 END;
 $$;
 
@@ -1885,11 +2318,20 @@ $$;
 -- 5b. v0.6 API — columnar compression (pure-SQL, TOAST/lz4 backed)
 --
 -- Layout per series table (created by add_compression_policy):
+--   <table>_heap        — the renamed partitioned heap parent (bulk
+--                          ingest COPY/INSERT and internal movers address
+--                          this directly; the view triggers are ~11x/row).
+--   <table>             — transparent UNION view: heap + lateral unpack
+--                          of the compressed sibling, with INSTEAD OF
+--                          INSERT/UPDATE/DELETE routing to the heap.
+--                          UPDATE/DELETE touching compressed rows raise
+--                          read-only. TRUNCATE must address the heap
+--                          (PG forbids TRUNCATE triggers on views).
 --   <table>_compressed  — partitioned template (RANGE seg_min_ts),
 --                          one partition <chunk>_compressed per chunk.
 --   unpack_<s>_<t>(seg) — generated per-table decoder, exact roundtrip
 --                          (floats: RAW only, bit-exact).
---   <table>_read        — static view: heap UNION ALL lateral unpack.
+--   <table>_read        — compat alias over the base view.
 --   <table>_read_range  — fast path with seg-bound pushdown (BRIN skip).
 --
 -- Codec set per column: raw | for | delta | auto | dict.
@@ -1997,12 +2439,16 @@ $$;
 -- compress_chunk (real partitions) and bench_codecs (temp tables).
 -- Levels: L0 raw rows + _r (window); L1 + _segno; L2 group + ordered
 -- arrays a<k>; L3 codec derivation + seg metadata. Returns segments.
+DROP FUNCTION IF EXISTS pgseries._pack_segments(
+    NAME, NAME, NAME, NAME, NAME, TEXT, NAME[], NAME, BOOLEAN,
+    INTEGER, JSONB, JSONB);
 CREATE OR REPLACE FUNCTION pgseries._pack_segments(
     p_src_schema NAME, p_src_table NAME,
     p_tgt_schema NAME, p_tgt_table NAME,
     p_timecol NAME, p_timecol_type TEXT,
     p_segmentby NAME[], p_orderby NAME, p_ob_desc BOOLEAN,
-    p_segment_rows INTEGER, p_codecs JSONB, p_requant JSONB)
+    p_segment_rows INTEGER, p_codecs JSONB, p_requant JSONB,
+    p_where TEXT DEFAULT '', p_bucket TEXT DEFAULT NULL)
 RETURNS BIGINT
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -2028,17 +2474,34 @@ DECLARE
     v_dict    TEXT;
     v_n       BIGINT;
     v_l2key   TEXT;
+    v_part    TEXT;   -- window PARTITION BY prefix (bucket and/or segmentby)
 BEGIN
     IF p_segmentby IS NULL OR array_length(p_segmentby, 1) IS NULL THEN
-        v_win := format('ORDER BY %s %s, ctid', v_ob, v_obdir);
+        v_part := '';
     ELSE
         SELECT string_agg(quote_ident(x), ', ') INTO v_segcols
         FROM unnest(p_segmentby) AS x;
+        v_part := v_segcols;
+    END IF;
+    -- Multi-chunk packs (compress_table) reset segments per source
+    -- bucket: the bucket expression becomes the leading window key
+    -- (inlined — a SELECT-list alias is not visible inside its own
+    -- OVER clause; the _bkt alias below exists only for GROUP BY).
+    IF p_bucket IS NOT NULL THEN
+        v_part := CASE WHEN v_part = '' THEN p_bucket
+                       ELSE p_bucket || ', ' || v_part END;
+    END IF;
+    IF v_part = '' THEN
+        v_win := format('ORDER BY %s %s, ctid', v_ob, v_obdir);
+    ELSE
         v_win := format('PARTITION BY %s ORDER BY %s %s, ctid',
-                        v_segcols, v_ob, v_obdir);
+                        v_part, v_ob, v_obdir);
     END IF;
     v_l2key := CASE WHEN v_segcols = '' THEN '_segno'
                     ELSE v_segcols || ', _segno' END;
+    IF p_bucket IS NOT NULL THEN
+        v_l2key := '_bkt, ' || v_l2key;
+    END IF;
 
     FOR r IN SELECT * FROM pgseries._colinfo(
                  p_src_schema, p_src_table, p_timecol, p_segmentby) LOOP
@@ -2139,8 +2602,8 @@ BEGIN
     END LOOP;
 
     EXECUTE format(
-        'WITH l0 AS (SELECT *, row_number() OVER (%s) AS _r '
-        || 'FROM %I.%I), '
+        'WITH l0 AS (SELECT *, row_number() OVER (%s) AS _r%s '
+        || 'FROM %I.%I%s), '
         || 'l1 AS (SELECT *%s, ((_r - 1) / %s) AS _segno FROM l0), '
         || 'l2 AS (SELECT %s, min(%I) AS _lo, max(%I) AS _hi, '
         || 'count(*) AS _n%s FROM l1 GROUP BY %s) '
@@ -2149,7 +2612,10 @@ BEGIN
         || 'SELECT row_number() OVER (ORDER BY %s), '
         || '_lo::TIMESTAMPTZ, _hi::TIMESTAMPTZ, _n%s '
         || 'FROM l2',
-        v_win, p_src_schema, p_src_table,
+        v_win,
+        CASE WHEN p_bucket IS NULL THEN '' ELSE format(', (%s) AS _bkt', p_bucket) END,
+        p_src_schema, p_src_table,
+        CASE WHEN p_where = '' THEN '' ELSE ' WHERE ' || p_where END,
         v_l1, p_segment_rows,
         v_l2key, p_timecol, p_timecol, v_l2arr,
         v_l2key,
@@ -2303,6 +2769,9 @@ $$;
 
 -- Column inventory of a series table (one row per live source column).
 -- consumed_by: 'segby' | 'time' | 'data'. gexpr set for generated cols.
+-- Resolves the heap when the transparent view is installed (views
+-- report no identity/generated flags, so the base name would
+-- misclassify columns post-swap).
 CREATE OR REPLACE FUNCTION pgseries._colinfo(
     p_schema NAME, p_table NAME,
     p_timecol NAME, p_segmentby NAME[])
@@ -2321,7 +2790,7 @@ AS $$
                 THEN pg_get_expr(d.adbin, d.adrelid) END
     FROM pg_attribute a
     LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-    WHERE a.attrelid = to_regclass(format('%I.%I', p_schema, p_table))
+    WHERE a.attrelid = to_regclass(pgseries._write_parent(p_schema, p_table))
       AND a.attnum > 0 AND NOT a.attisdropped
     ORDER BY a.attnum;
 $$;
@@ -2469,42 +2938,70 @@ SELECT series_schema, series_table, segmentby, orderby, orderby_desc,
        segment_rows, codecs, requant, created_at
 FROM pgseries.compression_policy;
 
--- Per-chunk compression stats (function, not view: sibling tables are
--- dynamic names, so this needs dynamic SQL per chunk).
+-- Per-chunk compression stats. Set-based: one UNION ALL probe per
+-- side (a single EXECUTE each) plus one pg_class size join — no
+-- per-chunk COUNT loop regardless of chunk count.
 CREATE OR REPLACE FUNCTION pgseries.compressed_chunk_stats(
     p_schema NAME, p_table NAME)
 RETURNS TABLE (chunk_name NAME, state TEXT, segments BIGINT,
                compressed_rows BIGINT, compressed_bytes BIGINT,
                heap_rows BIGINT)
-LANGUAGE plpgsql STABLE
+LANGUAGE plpgsql VOLATILE
 SECURITY DEFINER
 SET search_path = pgseries, pg_catalog
 AS $$
 DECLARE
-    r       RECORD;
-    v_cpart TEXT;
+    v_sql TEXT;
 BEGIN
     PERFORM pgseries._series(p_schema, p_table);
-    FOR r IN SELECT c.chunk_name, l.state
-             FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id)
-             WHERE c.series_schema = p_schema AND c.series_table = p_table
-             ORDER BY c.range_lower NULLS LAST LOOP
-        chunk_name := r.chunk_name;
-        state := r.state;
-        segments := 0;
-        compressed_rows := 0;
-        compressed_bytes := 0;
-        v_cpart := format('%I.%I', p_schema, r.chunk_name::TEXT || '_compressed');
-        IF to_regclass(v_cpart) IS NOT NULL THEN
-            EXECUTE format('SELECT count(*), COALESCE(sum(seg_row_count), 0) FROM %s',
-                           v_cpart) INTO segments, compressed_rows;
-            SELECT pg_total_relation_size(to_regclass(v_cpart))
-            INTO compressed_bytes;
-        END IF;
-        EXECUTE format('SELECT count(*) FROM %I.%I', p_schema, r.chunk_name)
-        INTO heap_rows;
-        RETURN NEXT;
-    END LOOP;
+    CREATE TEMP TABLE IF NOT EXISTS pgseries_stats_heap (cn NAME PRIMARY KEY, n BIGINT)
+        ON COMMIT DROP;
+    DELETE FROM pgseries_stats_heap;
+    CREATE TEMP TABLE IF NOT EXISTS pgseries_stats_comp (
+        cn NAME PRIMARY KEY, segs BIGINT, crows BIGINT, cbytes BIGINT)
+        ON COMMIT DROP;
+    DELETE FROM pgseries_stats_comp;
+
+    SELECT string_agg(
+               format('SELECT %L::NAME AS cn, count(*) AS n FROM %I.%I',
+                      c.chunk_name, c.chunk_schema, c.chunk_name),
+               ' UNION ALL ')
+    INTO v_sql
+    FROM pgseries.chunk c
+    WHERE c.series_schema = p_schema AND c.series_table = p_table;
+    IF v_sql IS NOT NULL THEN
+        EXECUTE 'INSERT INTO pgseries_stats_heap ' || v_sql;
+    END IF;
+
+    SELECT string_agg(
+               format('SELECT %L::NAME AS cn, count(*) AS segs, '
+                      || 'COALESCE(sum(seg_row_count), 0) AS crows '
+                      || 'FROM %I.%I',
+                      c.chunk_name, c.chunk_schema,
+                      (c.chunk_name::TEXT || '_compressed')::NAME),
+               ' UNION ALL ')
+    INTO v_sql
+    FROM pgseries.chunk c
+    WHERE c.series_schema = p_schema AND c.series_table = p_table
+      AND to_regclass(format('%I.%I', c.chunk_schema,
+                             (c.chunk_name::TEXT || '_compressed')::NAME))
+          IS NOT NULL;
+    IF v_sql IS NOT NULL THEN
+        EXECUTE 'INSERT INTO pgseries_stats_comp (cn, segs, crows) ' || v_sql;
+        UPDATE pgseries_stats_comp s SET cbytes = pg_total_relation_size(k.oid)
+        FROM pg_class k
+        WHERE k.relname = s.cn::TEXT || '_compressed';
+    END IF;
+
+    RETURN QUERY
+    SELECT c.chunk_name, l.state,
+           COALESCE(s.segs, 0), COALESCE(s.crows, 0), COALESCE(s.cbytes, 0),
+           COALESCE(h.n, 0)
+    FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id)
+    LEFT JOIN pgseries_stats_heap h ON h.cn = c.chunk_name
+    LEFT JOIN pgseries_stats_comp s ON s.cn = c.chunk_name
+    WHERE c.series_schema = p_schema AND c.series_table = p_table
+    ORDER BY c.range_lower NULLS LAST, c.chunk_name;
 END;
 $$;
 

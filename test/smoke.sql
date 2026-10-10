@@ -536,4 +536,143 @@ BEGIN
     END IF;
 END $$;
 
+DO $$ BEGIN RAISE NOTICE '--- 20. transparent base reads ---'; END $$;
+DO $$
+DECLARE v_base BIGINT; v_heap BIGINT; v_crows BIGINT;
+BEGIN
+    -- metrics has one compressed chunk (victim, recompressed in 17).
+    SELECT count(*) INTO v_base FROM public.metrics;
+    SELECT count(*) INTO v_heap FROM public.metrics_heap;
+    SELECT COALESCE(sum(compressed_rows), 0) INTO v_crows
+    FROM pgseries.compressed_chunk_stats('public', 'metrics');
+    IF v_base <> v_heap + v_crows THEN
+        RAISE EXCEPTION 'base % <> heap % + compressed %', v_base, v_heap, v_crows;
+    END IF;
+    IF v_crows < 1 THEN RAISE EXCEPTION 'victim must still be compressed'; END IF;
+    IF to_regclass('public.metrics_heap') IS NULL THEN
+        RAISE EXCEPTION 'heap parent missing after swap';
+    END IF;
+    -- _read alias kept working (covered in 16/17) and equals base.
+    IF (SELECT count(*) FROM public.metrics_read) <> v_base THEN
+        RAISE EXCEPTION '_read diverged from base';
+    END IF;
+END $$;
+
+DO $$ BEGIN RAISE NOTICE '--- 21. DML via transparent view ---'; END $$;
+INSERT INTO public.metrics (t, device, v)
+VALUES (now(), 'smoke21', 4242) RETURNING t, device, v;
+DO $$
+DECLARE v_lo TIMESTAMPTZ; v_hi TIMESTAMPTZ; v_n BIGINT;
+BEGIN
+    -- heap row round-trips through the view.
+    UPDATE public.metrics SET v = 4243 WHERE device = 'smoke21';
+    SELECT count(*) INTO v_n FROM public.metrics WHERE device = 'smoke21' AND v = 4243;
+    IF v_n <> 1 THEN RAISE EXCEPTION 'view UPDATE missed heap row'; END IF;
+    DELETE FROM public.metrics WHERE device = 'smoke21';
+    IF EXISTS (SELECT 1 FROM public.metrics WHERE device = 'smoke21') THEN
+        RAISE EXCEPTION 'view DELETE missed heap row';
+    END IF;
+    -- compressed rows are read-only through the view too.
+    SELECT range_lower, range_upper INTO v_lo, v_hi
+    FROM pgseries.show_chunks('public', 'metrics')
+    WHERE chunk_name = (SELECT victim FROM pgseries_victim);
+    BEGIN
+        UPDATE public.metrics SET v = -1 WHERE t >= v_lo AND t < v_hi;
+        RAISE EXCEPTION 'UPDATE of compressed rows must raise';
+    EXCEPTION WHEN read_only_sql_transaction THEN NULL;
+    END;
+    BEGIN
+        DELETE FROM public.metrics WHERE t >= v_lo AND t < v_hi;
+        RAISE EXCEPTION 'DELETE of compressed rows must raise';
+    EXCEPTION WHEN read_only_sql_transaction THEN NULL;
+    END;
+    -- writer keeps view privileges; heap-direct bypass works.
+    IF NOT has_table_privilege('pgseries_writer', 'public.metrics', 'INSERT') THEN
+        RAISE EXCEPTION 'writer must INSERT via base view';
+    END IF;
+    INSERT INTO public.metrics_heap (t, device, v)
+    SELECT now(), 'heapdirect', s FROM generate_series(1, 10) s;
+    IF (SELECT count(*) FROM public.metrics WHERE device = 'heapdirect') <> 10 THEN
+        RAISE EXCEPTION 'heap-direct rows not visible via base';
+    END IF;
+    DELETE FROM public.metrics_heap WHERE device = 'heapdirect';
+END $$;
+
+DO $$ BEGIN RAISE NOTICE '--- 22. compress_table set-based ---'; END $$;
+CREATE TABLE public.bulk (t TIMESTAMPTZ NOT NULL, device TEXT, v DOUBLE PRECISION);
+INSERT INTO public.bulk
+SELECT now() - '44 days'::INTERVAL - (s || ' minutes')::INTERVAL,
+       'd' || (s % 2), s FROM generate_series(1, 5000) AS s;
+SELECT pgseries.create_series_table('public', 'bulk', 't', '1 day');
+SELECT pgseries.precreate_chunks('public', 'bulk', 3);
+SELECT pgseries.move_default('public', 'bulk') AS bulk_moved;
+SELECT pgseries.add_compression_policy('public', 'bulk', '{device}', 't', false, 1000, '{"t": "delta"}');
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM public.bulk) <> 5000 THEN
+        RAISE EXCEPTION 'base must read 5000 pre-compress, got %',
+            (SELECT count(*) FROM public.bulk);
+    END IF;
+END $$;
+SELECT pgseries.compress_table('public', 'bulk') AS compress_all;
+DO $$
+DECLARE v_comp BIGINT; v_ready BIGINT; v_base BIGINT; v_h BIGINT; v_txt TEXT;
+BEGIN
+    SELECT count(*) INTO v_comp FROM pgseries.show_chunks('public', 'bulk')
+    WHERE state = 'compressed';
+    SELECT count(*) INTO v_ready FROM pgseries.show_chunks('public', 'bulk')
+    WHERE state = 'ready';
+    SELECT count(*) INTO v_base FROM public.bulk;
+    SELECT count(*) INTO v_h FROM public.bulk_heap;
+    IF v_comp < 3 THEN RAISE EXCEPTION 'want >=3 compressed, got %', v_comp; END IF;
+    IF v_base <> 5000 THEN RAISE EXCEPTION 'base lost rows: %', v_base; END IF;
+    IF v_h <> 0 THEN RAISE EXCEPTION 'heaps not drained: %', v_h; END IF;
+    IF v_ready < 3 THEN RAISE EXCEPTION 'precreated hot chunks must stay ready, got %', v_ready; END IF;
+    -- hot chunk excluded by default: fresh row + rerun compresses nothing.
+    INSERT INTO public.bulk (t, device, v) VALUES (now(), 'hot', 1);
+    IF (SELECT pgseries.compress_table('public', 'bulk')) <> 'nothing eligible to compress' THEN
+        RAISE EXCEPTION 'hot-only rerun must be a no-op';
+    END IF;
+    SELECT pgseries.compress_table('public', 'bulk', NULL, true) INTO v_txt;
+    IF (SELECT count(*) FROM public.bulk) <> 5001 THEN
+        RAISE EXCEPTION 'hot include lost rows';
+    END IF;
+END $$;
+
+DO $$ BEGIN RAISE NOTICE '--- 23. stats set-based totals ---'; END $$;
+DO $$
+DECLARE v_sum BIGINT;
+BEGIN
+    SELECT COALESCE(sum(compressed_rows), 0) + COALESCE(sum(heap_rows), 0)
+    INTO v_sum FROM pgseries.compressed_chunk_stats('public', 'bulk');
+    IF v_sum <> 5001 THEN RAISE EXCEPTION 'stats total %, want 5001', v_sum; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pgseries.compressed_chunk_stats('public', 'bulk')
+                   WHERE segments > 0 AND compressed_bytes > 0) THEN
+        RAISE EXCEPTION 'stats show no compressed segments';
+    END IF;
+END $$;
+
+DO $$ BEGIN RAISE NOTICE '--- 24. drop policy restores plain table ---'; END $$;
+DO $$
+DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT chunk_name FROM pgseries.show_chunks('public', 'bulk')
+             WHERE state = 'compressed' LOOP
+        PERFORM pgseries.decompress_chunk('public', 'bulk', r.chunk_name);
+    END LOOP;
+END $$;
+SELECT pgseries.drop_compression_policy('public', 'bulk');
+DO $$
+DECLARE v_kind CHAR;
+BEGIN
+    SELECT relkind INTO v_kind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relname = 'bulk';
+    IF v_kind <> 'p' THEN RAISE EXCEPTION 'base must be a partitioned table again, got %', v_kind; END IF;
+    IF to_regclass('public.bulk_heap') IS NOT NULL THEN RAISE EXCEPTION 'heap leftover'; END IF;
+    IF to_regclass('public.bulk_read') IS NOT NULL THEN RAISE EXCEPTION '_read leftover'; END IF;
+    IF (SELECT count(*) FROM public.bulk) <> 5001 THEN
+        RAISE EXCEPTION 'teardown lost rows';
+    END IF;
+END $$;
+
 SELECT 'SMOKE OK' AS result;
