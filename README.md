@@ -114,13 +114,16 @@ further: one `UNION ALL` leg per compressed sibling, each carrying
 its chunk bounds (plus one leg per `segmentby` value when narrow)
 as statically-true quals — with `constraint_exclusion = on`,
 ranged queries prune dead legs at plan time (pure-SQL pushdown;
-see `tune()`). With `value_legs => true` on the policy, each leg
-further splits per `segmentby` value (plus catch-all), so
-segby-selective queries prune per value too — at a price: queries
-*without* a segby predicate unpack every value leg (~5.6x slower
-measured on a segby-less range vs time legs). Default off;
-opt in for device-lookup-shaped tables, keep off for GROUP BY
-analytics.
+see `tune()`). Bounds must be plan-time constants: literals and
+prepared statements under `force_custom_plan` prune; raw `now()`
+does not (STABLE never const-folds — use prepare or `_read_range`).
+
+Per-query shape choice, no flag: the base view carries time legs
+(unpack each segment once — safe default for GROUP BY analytics),
+and `<table>_byseg` (single-column `segmentby` only) carries one
+leg per value plus catch-all, so segby-selective queries prune
+per value. Querying every value leg costs ~5.6x a time leg on
+segby-less ranges (measured) — pick per query, not per table.
 
 Two automatic guards (with `NOTICE`, stored resolved):
 

@@ -386,7 +386,7 @@ BEGIN
     IF v_c ->> 'r' <> 'for' THEN RAISE EXCEPTION 'auto failed for noise: %', v_c; END IF;
     IF v_c::TEXT LIKE '%auto%' THEN RAISE EXCEPTION 'unresolved auto stored: %', v_c; END IF;
 END $$;
-SELECT pgseries.add_compression_policy('public', 'metrics', '{device}', 't', false, 100, '{"t": "delta"}', '{}', true);
+SELECT pgseries.add_compression_policy('public', 'metrics', '{device}', 't', false, 100, '{"t": "delta"}');
 DO $$
 BEGIN
     IF (SELECT count(*) FROM pgseries_information.compression_settings
@@ -966,11 +966,19 @@ BEGIN
     IF position('u.t >=' IN v_def) = 0 THEN
         RAISE EXCEPTION 'legs carry no static time-bound quals';
     END IF;
-    -- per-value legs for the narrow segmentby (device has 3 values).
-    IF position('u.device =' IN v_def) = 0 THEN
-        RAISE EXCEPTION 'no per-value segmentby legs';
+    -- base carries time legs only (no per-value duplication).
+    IF position('u.device =' IN v_def) <> 0 THEN
+        RAISE EXCEPTION 'base must not carry per-value legs';
     END IF;
-    IF (SELECT count(*) FROM public.metrics WHERE device = 'd0')
+    -- per-value legs live on the _byseg sibling view instead.
+    IF to_regclass('public.metrics_byseg') IS NULL THEN
+        RAISE EXCEPTION 'metrics_byseg view missing';
+    END IF;
+    SELECT pg_get_viewdef(to_regclass('public.metrics_byseg')) INTO v_def;
+    IF position('u.device =' IN v_def) = 0 THEN
+        RAISE EXCEPTION 'no per-value segmentby legs on _byseg';
+    END IF;
+    IF (SELECT count(*) FROM public.metrics_byseg WHERE device = 'd0')
        <> (SELECT count(*) FROM public.metrics_pre WHERE device = 'd0') THEN
         RAISE EXCEPTION 'segby-filtered read diverged';
     END IF;

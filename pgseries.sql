@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS pgseries.compression_policy (
 -- v0.2 migrations (idempotent; earlier installs predate them).
 ALTER TABLE pgseries.chunk ADD COLUMN IF NOT EXISTS parent_chunk NAME;
 ALTER TABLE pgseries.compression_policy
-    ADD COLUMN IF NOT EXISTS value_legs BOOLEAN NOT NULL DEFAULT false;
+    DROP COLUMN IF EXISTS value_legs;
 -- seg_space on every compressed tree (cascades to partitions).
 DO $$ DECLARE r RECORD; BEGIN
     FOR r IN SELECT series_schema, series_table
@@ -1846,6 +1846,10 @@ BEGIN
                    p_schema, p_table);
     EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %I.%I '
                    || 'TO pgseries_writer', p_schema, p_table);
+    IF to_regclass(format('%I.%I', p_schema, p_table || '_byseg')) IS NOT NULL THEN
+        EXECUTE format('GRANT SELECT ON %I.%I TO pgseries_reader, pgseries_writer',
+                       p_schema, p_table || '_byseg');
+    END IF;
 END;
 $$;
 
@@ -1874,6 +1878,7 @@ BEGIN
                    p_schema, p_table || '_read_range',
                    s.time_col_type, s.time_col_type);
     EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table);
+    EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table || '_byseg');
     EXECUTE format('DROP FUNCTION IF EXISTS %s_ins()', 'pgseries.write_' || v_slug);
     EXECUTE format('DROP FUNCTION IF EXISTS %s_upd()', 'pgseries.write_' || v_slug);
     EXECUTE format('DROP FUNCTION IF EXISTS %s_del()', 'pgseries.write_' || v_slug);
@@ -2044,6 +2049,8 @@ BEGIN
 END;
 $$;
 
+DROP FUNCTION IF EXISTS pgseries.add_compression_policy(
+    NAME, NAME, NAME[], NAME, BOOLEAN, INTEGER, JSONB, JSONB, BOOLEAN);
 CREATE OR REPLACE FUNCTION pgseries.add_compression_policy(
     p_schema NAME, p_table NAME,
     p_segmentby NAME[] DEFAULT '{}',
@@ -2051,8 +2058,7 @@ CREATE OR REPLACE FUNCTION pgseries.add_compression_policy(
     p_orderby_desc BOOLEAN DEFAULT false,
     p_segment_rows INTEGER DEFAULT 1000,
     p_codecs JSONB DEFAULT '{}',
-    p_requant JSONB DEFAULT '{}',
-    p_value_legs BOOLEAN DEFAULT false)
+    p_requant JSONB DEFAULT '{}')
 RETURNS VOID
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -2174,11 +2180,10 @@ BEGIN
 
     INSERT INTO pgseries.compression_policy
         (series_schema, series_table, segmentby, orderby, orderby_desc,
-         segment_rows, codecs, requant, value_legs)
+         segment_rows, codecs, requant)
     VALUES (p_schema, p_table, COALESCE(p_segmentby, '{}'), v_ob,
             p_orderby_desc, p_segment_rows,
-            COALESCE(p_codecs, '{}'), COALESCE(p_requant, '{}'),
-            COALESCE(p_value_legs, false));
+            COALESCE(p_codecs, '{}'), COALESCE(p_requant, '{}'));
 
     -- The swap renames the heap aside and generates the unpack
     -- (heap-bound return type), transparent base view + DML triggers.
@@ -2264,6 +2269,7 @@ BEGIN
     -- Views first (INSTEAD OF triggers die with the base view).
     EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table);
     EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table || '_read');
+    EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table || '_byseg');
     IF FOUND THEN
         EXECUTE format('DROP FUNCTION IF EXISTS %I.%I(%s, %s)',
                        p_schema, p_table || '_read_range',
@@ -2436,7 +2442,7 @@ $$;
 -- segmentby or >33 distinct keeps the plain time leg.
 CREATE OR REPLACE FUNCTION pgseries._node_legs(
     p_schema NAME, p_table NAME, p_node NAME, p_cschema NAME,
-    p_lo TIMESTAMPTZ, p_hi TIMESTAMPTZ)
+    p_lo TIMESTAMPTZ, p_hi TIMESTAMPTZ, p_valued BOOLEAN DEFAULT false)
 RETURNS TEXT
 LANGUAGE plpgsql STABLE
 SET search_path = pgseries, pg_catalog
@@ -2467,11 +2473,12 @@ BEGIN
                       s.time_column, p_lo::TEXT, s.time_col_type,
                       s.time_column, p_hi::TEXT, s.time_col_type);
     END IF;
-    -- Opt-in per policy: value legs prune segby-selective queries
-    -- but multiply unpack work by (distinct+1) for queries without a
-    -- segby predicate (measured 5.6x slower on a segby-less range).
-    -- Default off; GROUP BY analytics wants time legs.
-    IF NOT COALESCE(pol.value_legs, false) THEN
+    -- Time legs (p_valued=false) unpack each segment once: safe
+    -- default for GROUP BY analytics. Value legs multiply unpack work
+    -- by (distinct+1) for queries without a segby predicate (measured
+    -- 5.6x slower on a segby-less range) — the _byseg view carries
+    -- them instead, so each query picks its shape.
+    IF NOT p_valued THEN
         RETURN format(' UNION ALL SELECT u.* FROM %s AS c, LATERAL %s(c) AS u '
                       || 'WHERE u.%I >= %L::%s AND u.%I < %L::%s',
                       v_cpart, v_unpack,
@@ -2519,6 +2526,41 @@ BEGIN
 END;
 $$;
 
+-- True when the policy has exactly one segmentby column.
+CREATE OR REPLACE FUNCTION pgseries.pol_segmentby_single(
+    p_schema NAME, p_table NAME)
+RETURNS BOOLEAN
+LANGUAGE sql STABLE
+SET search_path = pgseries, pg_catalog
+AS $$
+    SELECT COALESCE(array_length(segmentby, 1), 0) = 1
+    FROM pgseries.compression_policy
+    WHERE series_schema = p_schema AND series_table = p_table;
+$$;
+
+-- Compressed nodes with bounds (one row per time-chunk node that
+-- has a sibling partition). Shared by both leg builders below.
+CREATE OR REPLACE FUNCTION pgseries._leg_nodes(
+    p_schema NAME, p_table NAME)
+RETURNS TABLE (node NAME, cschema NAME, lo TIMESTAMPTZ, hi TIMESTAMPTZ)
+LANGUAGE sql STABLE
+SET search_path = pgseries, pg_catalog
+AS $$
+    SELECT COALESCE(ch.parent_chunk, ch.chunk_name) AS node,
+           ch.chunk_schema AS cschema,
+           min(ch.range_lower) AS lo, max(ch.range_upper) AS hi
+    FROM pgseries.chunk ch
+    JOIN pgseries.chunk_lease lh USING (chunk_id)
+    WHERE ch.series_schema = p_schema
+      AND ch.series_table = p_table
+      AND lh.state IN ('compressing', 'compressed')
+      AND to_regclass(format('%I.%I', ch.chunk_schema,
+               (COALESCE(ch.parent_chunk, ch.chunk_name)::TEXT
+                || '_compressed')::NAME)) IS NOT NULL
+    GROUP BY 1, 2
+    HAVING min(ch.range_lower) IS NOT NULL;
+$$;
+
 CREATE OR REPLACE FUNCTION pgseries._read_ddl(
     p_schema NAME, p_table NAME)
 RETURNS SETOF TEXT
@@ -2531,33 +2573,32 @@ DECLARE
     v_tpl   TEXT := format('%I.%I', p_schema, p_table || '_compressed');
     v_unpack TEXT := 'pgseries.unpack_' || pgseries._slug(p_schema, p_table);
     v_view  TEXT := format('%I.%I', p_schema, p_table || '_read');
+    v_byseg TEXT := format('%I.%I', p_schema, p_table || '_byseg');
     v_range TEXT := format('%I.%I', p_schema, p_table || '_read_range');
     v_legs  TEXT := '';
+    v_bylegs TEXT := '';
     v_orpha TEXT := '';
     r       RECORD;
 BEGIN
     s := pgseries._series(p_schema, p_table);
-    -- Per-sibling legs via _node_legs (time bounds always, plus
-    -- per-value legs for narrow single-column segmentby).
+    -- Time legs (safe default): one per sibling, unpack-once.
     v_legs := '';
-    FOR r IN
-        SELECT DISTINCT COALESCE(ch.parent_chunk, ch.chunk_name) AS node,
-                        ch.chunk_schema AS cs,
-                        min(ch.range_lower) AS lo, max(ch.range_upper) AS hi
-        FROM pgseries.chunk ch
-        JOIN pgseries.chunk_lease lh USING (chunk_id)
-        WHERE ch.series_schema = p_schema
-          AND ch.series_table = p_table
-          AND lh.state IN ('compressing', 'compressed')
-          AND to_regclass(format('%I.%I', ch.chunk_schema,
-                   (COALESCE(ch.parent_chunk, ch.chunk_name)::TEXT
-                    || '_compressed')::NAME)) IS NOT NULL
-        GROUP BY 1, 2
-        HAVING min(ch.range_lower) IS NOT NULL
-    LOOP
+    FOR r IN SELECT * FROM pgseries._leg_nodes(p_schema, p_table) LOOP
         v_legs := v_legs || pgseries._node_legs(
-            p_schema, p_table, r.node, r.cs, r.lo, r.hi);
+            p_schema, p_table, r.node, r.cschema, r.lo, r.hi, false);
     END LOOP;
+    -- Per-value legs live on the _byseg sibling view (opt-in per
+    -- query, not per table): same nodes, value-split form. Always
+    -- emitted when single-segby (heap-only while nothing is
+    -- compressed) so refreshes never leave a stale view behind to
+    -- block cpart DROPs.
+    v_bylegs := '';
+    IF pol_segmentby_single(p_schema, p_table) THEN
+        FOR r IN SELECT * FROM pgseries._leg_nodes(p_schema, p_table) LOOP
+            v_bylegs := v_bylegs || pgseries._node_legs(
+                p_schema, p_table, r.node, r.cschema, r.lo, r.hi, true);
+        END LOOP;
+    END IF;
     -- Siblings without catalog bounds: unprunable fallback legs
     -- (always correct, never skipped).
     SELECT COALESCE(string_agg(
@@ -2583,6 +2624,14 @@ BEGIN
     RETURN NEXT
         format('CREATE OR REPLACE VIEW %s AS SELECT * FROM %I.%I',
                v_view, p_schema, p_table);
+    -- Per-value sibling view (read-only): same heap branch, value
+    -- legs instead of time legs. Only when the policy has a single
+    -- segmentby column; orphans ride along unfiltered as on base.
+    IF pol_segmentby_single(p_schema, p_table) THEN
+        RETURN NEXT
+            format('CREATE OR REPLACE VIEW %s AS SELECT * FROM %s%s%s',
+                   v_byseg, v_heap, v_bylegs, v_orpha);
+    END IF;
     RETURN NEXT
         format('CREATE OR REPLACE FUNCTION %s(a %s, b %s) '
                || 'RETURNS SETOF %I.%I LANGUAGE sql STABLE PARALLEL RESTRICTED '
