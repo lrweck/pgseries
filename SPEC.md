@@ -872,7 +872,7 @@ goal — the real commitments are in *Architecture* and
 | Reorder / clustering policies | `CLUSTER` on chunks via PgQue schedule | **v0.8** |
 | `timescaledb_information` views | `pgseries_information.{jobs, job_stats, job_errors, chunks, chunks_detailed_size, hypertable_size, compression_settings, compressed_chunk_stats, continuous_aggregates, cagg_lag, default_partition_lag}` (subset shipped earlier; full surface by v0.8) | **v0.8** |
 | `pgseries.add_index(table, definition)` | Like `CREATE INDEX ON <hypertable>` but auto-applies to future chunks | **v0.8** |
-| `add_dimension` (space partitioning) | Catalog-ready since v0.1; API ships at v1.0 | **v1.0** |
+| `add_dimension` (space partitioning) | Catalog-ready since v0.1; API ships at v0.2 | **v0.2** |
 
 ### Partial or lossy
 

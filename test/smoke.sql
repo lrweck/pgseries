@@ -265,10 +265,6 @@ END $$;
 DO $$ BEGIN RAISE NOTICE '--- 10. forward stubs raise 0A000 ---'; END $$;
 DO $$
 BEGIN
-    BEGIN PERFORM pgseries.add_dimension('public', 'metrics', 'device');
-        RAISE EXCEPTION 'add_dimension must raise';
-    EXCEPTION WHEN feature_not_supported THEN NULL;
-    END;
     BEGIN PERFORM pgseries.add_continuous_aggregate('c', 'select 1');
         RAISE EXCEPTION 'add_continuous_aggregate must raise';
     EXCEPTION WHEN feature_not_supported THEN NULL;
@@ -785,6 +781,109 @@ BEGIN
     IF to_regclass('public.dd') IS NULL THEN RAISE EXCEPTION 'dd table gone'; END IF;
     IF EXISTS (SELECT 1 FROM pgseries.series_table WHERE series_table = 'dd') THEN
         RAISE EXCEPTION 'dd registration survived';
+    END IF;
+END $$;
+
+DO $$ BEGIN RAISE NOTICE '--- 27. add_dimension fan-out ---'; END $$;
+CREATE TABLE public.dimdemo (
+    ts TIMESTAMPTZ NOT NULL, tenant TEXT NOT NULL, v INT,
+    seq BIGINT GENERATED ALWAYS AS IDENTITY,
+    PRIMARY KEY (ts, tenant));
+INSERT INTO public.dimdemo (ts, tenant, v)
+SELECT now() - '10 days'::INTERVAL - (s || ' hours')::INTERVAL,
+       't' || (s % 4), s FROM generate_series(1, 500) AS s;
+SELECT pgseries.create_series_table('public', 'dimdemo', 'ts', '1 day');
+SELECT pgseries.move_default('public', 'dimdemo');
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM public.dimdemo) <> 500 THEN RAISE EXCEPTION 'dimdemo lost rows'; END IF;
+END $$;
+SELECT pgseries.add_dimension('public', 'dimdemo', 'tenant', 'space_hash', 4) AS dim_out;
+DO $$
+DECLARE v_leaves BIGINT; v_base BIGINT;
+BEGIN
+    -- every time-chunk fanned to 4 leaves, data intact, identity kept.
+    SELECT count(*) INTO v_leaves FROM pgseries.show_chunks('public', 'dimdemo');
+    IF v_leaves < 8 THEN RAISE EXCEPTION 'want >=8 leaf chunks, got %', v_leaves; END IF;
+    IF EXISTS (SELECT 1 FROM pgseries.show_chunks('public', 'dimdemo')
+               WHERE space_index NOT BETWEEN 0 AND 3) THEN
+        RAISE EXCEPTION 'space_index out of range';
+    END IF;
+    SELECT count(*) INTO v_base FROM public.dimdemo;
+    IF v_base <> 500 THEN RAISE EXCEPTION 'fan-out lost rows: %', v_base; END IF;
+    IF (SELECT count(DISTINCT seq) FROM public.dimdemo) <> 500 THEN
+        RAISE EXCEPTION 'identity not preserved across fan-out';
+    END IF;
+    -- writes route through 2 levels (heap parent and view agree).
+    -- Timestamp inside an existing (converted) chunk range.
+    INSERT INTO public.dimdemo (ts, tenant, v)
+    VALUES (now() - '15 days'::INTERVAL, 't9', 4242);
+    IF (SELECT count(*) FROM public.dimdemo WHERE tenant = 't9') <> 1 THEN
+        RAISE EXCEPTION '2-level write routing failed';
+    END IF;
+    -- placed straight into a leaf (mover idle afterwards).
+    IF (SELECT pgseries.move_default('public', 'dimdemo')) <> 0 THEN
+        RAISE EXCEPTION 'write should have routed, not stashed';
+    END IF;
+    IF to_regclass('public.dimdemo_heap') IS NOT NULL THEN
+        RAISE EXCEPTION 'pre-policy table should have no heap rename';
+    END IF;
+END $$;
+-- errors: range type, double add, PK missing the space column.
+DO $$
+BEGIN
+    BEGIN PERFORM pgseries.add_dimension('public', 'dimdemo', 'tenant', 'space_range', 4);
+        RAISE EXCEPTION 'space_range must raise';
+    EXCEPTION WHEN feature_not_supported THEN NULL;
+    END;
+    BEGIN PERFORM pgseries.add_dimension('public', 'dimdemo', 'tenant', 'space_hash', 4);
+        RAISE EXCEPTION 'double add must raise';
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
+END $$;
+CREATE TABLE public.pk2 (t TIMESTAMPTZ NOT NULL, tenant TEXT, v INT, PRIMARY KEY (t));
+INSERT INTO public.pk2 VALUES (now(), 'x', 1);
+SELECT pgseries.create_series_table('public', 'pk2', 't', '1 day');
+SELECT pgseries.move_default('public', 'pk2');
+DO $$
+BEGIN
+    BEGIN PERFORM pgseries.add_dimension('public', 'pk2', 'tenant');
+        RAISE EXCEPTION 'PK-without-space-col must raise';
+    EXCEPTION WHEN invalid_parameter_value THEN NULL;
+    END;
+END $$;
+-- compress + drop across the fan-out.
+SELECT pgseries.add_compression_policy('public', 'dimdemo', '{tenant}', 'ts', false, 100, '{"ts": "delta"}');
+SELECT pgseries.compress_table('public', 'dimdemo', NULL, true, 1) AS dim_compress;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pgseries.show_chunks('public', 'dimdemo')
+                   WHERE state = 'compressed') THEN
+        RAISE EXCEPTION 'no leaf compressed';
+    END IF;
+    IF (SELECT count(*) FROM public.dimdemo) <> 501 THEN
+        RAISE EXCEPTION 'post-compress total wrong';
+    END IF;
+END $$;
+-- retention drops whole nodes (leaf-grouped); data spans ~10-31d
+-- ago so a 15d cutoff keeps recent nodes and drops old ones.
+SELECT * FROM pgseries.drop_chunks('public', 'dimdemo', '15 days') AS dim_dropped;
+DO $$
+DECLARE v_left BIGINT; v_base BIGINT;
+BEGIN
+    SELECT count(*) INTO v_left FROM pgseries.show_chunks('public', 'dimdemo');
+    SELECT count(*) INTO v_base FROM public.dimdemo;
+    IF v_left = 0 OR v_base < 1 THEN
+        RAISE EXCEPTION 'retention dropped everything?!';
+    END IF;
+    IF v_base >= 501 THEN
+        RAISE EXCEPTION 'retention dropped nothing?!';
+    END IF;
+    -- every remaining leaf's node still exists (no orphans).
+    IF EXISTS (SELECT 1 FROM pgseries.chunk c WHERE c.series_table = 'dimdemo'
+               AND to_regclass('"' || c.chunk_schema || '"."' || c.parent_chunk || '"') IS NULL
+               AND to_regclass('"' || c.chunk_schema || '"."' || c.chunk_name || '"') IS NULL) THEN
+        RAISE EXCEPTION 'orphan leaf without node or table';
     END IF;
 END $$;
 

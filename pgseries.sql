@@ -10,6 +10,9 @@
 --        SYNCHRONOUS dispatcher (run_job_now). The PgQue ticker /
 --        vendored pgque-core is NOT bundled here; run_job_now is the
 --        stand-in with the same per-job advisory-lock contract.
+--        v0.2 space partitioning: add_dimension() with hash
+--        sub-partitioning (in-place fan-out, tuple-keyed chunks);
+--        space_range deferred, parallel-copy loader in scripts/.
 --        v0.6 (columnar compression) implemented in pure SQL: pluggable
 --        per-column codecs (raw/for/delta/auto/dict) over TOAST/lz4,
 --        generated unpack, transparent base-table reads (UNION view +
@@ -159,6 +162,21 @@ CREATE TABLE IF NOT EXISTS pgseries.compression_policy (
     PRIMARY KEY (series_schema, series_table)
 );
 
+-- v0.2 migrations (idempotent; earlier installs predate them).
+ALTER TABLE pgseries.chunk ADD COLUMN IF NOT EXISTS parent_chunk NAME;
+-- seg_space on every compressed tree (cascades to partitions).
+DO $$ DECLARE r RECORD; BEGIN
+    FOR r IN SELECT series_schema, series_table
+             FROM pgseries.compression_policy LOOP
+        EXECUTE format('ALTER TABLE %I.%I ADD COLUMN IF NOT EXISTS '
+                       || 'seg_space INTEGER NOT NULL DEFAULT 0',
+            r.series_schema, r.series_table || '_compressed');
+    END LOOP;
+END $$;
+-- Pre-dimension rows are their own parent (single time-chunk chunks).
+UPDATE pgseries.chunk SET parent_chunk = chunk_name
+WHERE parent_chunk IS NULL;
+
 -- ---------------------------------------------------------------------
 -- 2. Internal helpers (underscore = internal, but callable by tests)
 -- ---------------------------------------------------------------------
@@ -284,8 +302,10 @@ BEGIN
     -- backfilled tables whose newest chunks are pre-created empties,
     -- so the oldest leaves join too. Caps keep every leaf scan
     -- bounded (LIMIT stops early; empty leaves are ~1ms).
-    CREATE TEMP TABLE IF NOT EXISTS pgseries_sample_leaves (
-        cschema NAME, cname NAME, lo TIMESTAMPTZ) ON COMMIT DROP;
+    IF to_regclass('pg_temp.pgseries_sample_leaves') IS NULL THEN
+        CREATE TEMP TABLE pgseries_sample_leaves (
+            cschema NAME, cname NAME, lo TIMESTAMPTZ) ON COMMIT DROP;
+    END IF;
     DELETE FROM pgseries_sample_leaves;
     INSERT INTO pgseries_sample_leaves
     SELECT c.chunk_schema, c.chunk_name, c.range_lower
@@ -318,25 +338,28 @@ BEGIN
     -- K most recent compressed leaves, unpacked (cap in segments).
     IF to_regclass(v_ctpl) IS NOT NULL
        AND to_regproc(v_unpack) IS NOT NULL THEN
+        -- Shared node siblings (one per time-chunk); unpack sees all
+        -- slices, no space filter needed for a sample.
         SELECT COALESCE(string_agg(
                    format('(SELECT u.* FROM (SELECT * FROM %I.%I LIMIT %s) AS c, '
                           || 'LATERAL %s(c) AS u)',
                           t.cschema,
-                          (t.cname::TEXT || '_compressed')::NAME,
+                          (t.node::TEXT || '_compressed')::NAME,
                           v_segcap, v_unpack),
                    ' UNION ALL '), '')
         INTO v_comp
-        FROM (SELECT t.cschema, t.cname
+        FROM (SELECT DISTINCT t.cschema,
+                              COALESCE(c.parent_chunk, c.chunk_name) AS node
               FROM pgseries_sample_leaves t
               JOIN pgseries.chunk c
                 ON c.chunk_schema = t.cschema AND c.chunk_name = t.cname
               JOIN pgseries.chunk_lease l USING (chunk_id)
               WHERE l.state IN ('compressing', 'compressed')
                 AND to_regclass(format('%I.%I', t.cschema,
-                                       (t.cname::TEXT || '_compressed')::NAME))
+                                       (COALESCE(c.parent_chunk, c.chunk_name)::TEXT
+                                        || '_compressed')::NAME))
                     IS NOT NULL
-              ORDER BY t.lo DESC NULLS LAST, t.cname DESC
-              LIMIT 8) t;
+              ORDER BY 2 DESC LIMIT 8) t;
     ELSE
         v_comp := '';
     END IF;
@@ -437,6 +460,50 @@ $$;
 -- Create + attach one chunk, register catalog + lease (pending->ready).
 -- Runs inside the caller's transaction; caller holds the per-table
 -- advisory lock.
+-- Fan a hash-partitioned node out into N leaves (<node>_s0..sN-1).
+-- Leaves inherit the rowtype (identity dropped, generated kept —
+-- same rule as _create_chunk); indexes cascade from the series
+-- parent at ATTACH time (verified through two levels).
+CREATE OR REPLACE FUNCTION pgseries._subpartition_node(
+    p_schema NAME, p_node NAME, p_col NAME, p_n INTEGER)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pgseries, pg_catalog
+AS $$
+DECLARE
+    i     INTEGER;
+    v_lf  NAME;
+    v_c   NAME;
+BEGIN
+    FOR i IN 0 .. p_n - 1 LOOP
+        v_lf := (p_node::TEXT || '_s' || i)::NAME;
+        IF to_regclass(format('%I.%I', p_schema, v_lf)) IS NOT NULL THEN
+            RAISE EXCEPTION 'pgseries: sub-partition name %.% already exists',
+                p_schema, v_lf
+                USING ERRCODE = 'duplicate_table';
+        END IF;
+        EXECUTE format(
+            'CREATE TABLE %I.%I (LIKE %I.%I '
+            || 'INCLUDING DEFAULTS INCLUDING CONSTRAINTS '
+            || 'INCLUDING GENERATED INCLUDING IDENTITY)',
+            p_schema, v_lf, p_schema, p_node);
+        FOR v_c IN
+            SELECT a.attname FROM pg_attribute a
+            WHERE a.attrelid = to_regclass(
+                      format('%I.%I', p_schema, p_node))
+              AND a.attidentity <> ''
+        LOOP
+            EXECUTE format('ALTER TABLE %I.%I ALTER COLUMN %I DROP IDENTITY',
+                p_schema, v_lf, v_c);
+        END LOOP;
+        EXECUTE format('ALTER TABLE %I.%I ATTACH PARTITION %I.%I '
+                       || 'FOR VALUES WITH (MODULUS %s, REMAINDER %s)',
+            p_schema, p_node, p_schema, v_lf, p_n, i);
+    END LOOP;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION pgseries._create_chunk(
     p_schema NAME, p_table NAME, p_lower TIMESTAMPTZ, p_upper TIMESTAMPTZ)
 RETURNS NAME
@@ -451,17 +518,23 @@ DECLARE
     v_cols     TEXT;
     v_c        NAME;
     v_wp       TEXT := pgseries._write_parent(p_schema, p_table);
+    v_sdim     NAME;
+    v_sn       INTEGER;
+    v_leaf     NAME;
+    i          INTEGER;
 BEGIN
     s := pgseries._series(p_schema, p_table);
 
-    -- Idempotency: same lower bound already registered -> return it.
+    -- Idempotency: same lower bound already registered -> return it
+    -- (lowest space_index for determinism on fanned-out chunks).
     PERFORM 1 FROM pgseries.chunk
     WHERE series_schema = p_schema AND series_table = p_table
       AND range_lower = p_lower;
     IF FOUND THEN
         SELECT chunk_name INTO v_chunk FROM pgseries.chunk
         WHERE series_schema = p_schema AND series_table = p_table
-          AND range_lower = p_lower;
+          AND range_lower = p_lower
+        ORDER BY space_index LIMIT 1;
         RETURN v_chunk;
     END IF;
 
@@ -474,11 +547,21 @@ BEGIN
             USING ERRCODE = 'duplicate_table';
     END IF;
 
+    -- Space fan-out (if any): the node itself is hash-partitioned so
+    -- _subpartition_node can hang leaves off it below.
+    SELECT dim_name, number_partitions
+    INTO v_sdim, v_sn
+    FROM pgseries.dimension
+    WHERE series_schema = p_schema AND series_table = p_table
+      AND dim_type = 'space_hash';
     EXECUTE format(
         'CREATE TABLE %I.%I (LIKE %s '
         || 'INCLUDING DEFAULTS INCLUDING CONSTRAINTS '
-        || 'INCLUDING GENERATED INCLUDING IDENTITY)',
-        p_schema, v_chunk, v_wp);
+        || 'INCLUDING GENERATED INCLUDING IDENTITY)%s',
+        p_schema, v_chunk, v_wp,
+        CASE WHEN FOUND
+             THEN format(' PARTITION BY HASH (%I)', v_sdim)
+             ELSE '' END);
 
     -- Leaves may not own identity columns (verified): the parent's
     -- shared identity governs. Generated columns must stay (verified:
@@ -491,6 +574,12 @@ BEGIN
         EXECUTE format('ALTER TABLE %I.%I ALTER COLUMN %I DROP IDENTITY',
             p_schema, v_chunk, v_c);
     END LOOP;
+
+    -- Fan out before the drain so it lands straight in leaves.
+    IF v_sdim IS NOT NULL THEN
+        PERFORM pgseries._subpartition_node(
+            p_schema, v_chunk, v_sdim, v_sn);
+    END IF;
 
     -- Load-then-attach (PG docs pattern): pull this bucket's rows out
     -- of DEFAULT into the unattached table FIRST, so the subsequent
@@ -515,14 +604,33 @@ BEGIN
         p_lower::TEXT, s.time_col_type,
         p_upper::TEXT, s.time_col_type);
 
-    INSERT INTO pgseries.chunk
-        (series_schema, series_table, chunk_schema, chunk_name,
-         range_lower, range_upper, space_index)
-    VALUES (p_schema, p_table, p_schema, v_chunk, p_lower, p_upper, 0)
-    RETURNING chunk_id INTO v_id;
-
-    INSERT INTO pgseries.chunk_lease (chunk_id, state) VALUES (v_id, 'pending');
-    PERFORM pgseries._lease_transition(p_schema, v_chunk, 'ready');
+    -- Space fan-out: one catalog row per leaf (space_index set).
+    -- Leaves were created before the drain above; the router fanned
+    -- rows into them.
+    IF v_sdim IS NOT NULL THEN
+        FOR i IN 0 .. v_sn - 1 LOOP
+            v_leaf := (v_chunk::TEXT || '_s' || i)::NAME;
+            INSERT INTO pgseries.chunk
+                (series_schema, series_table, chunk_schema, chunk_name,
+                 range_lower, range_upper, space_index, parent_chunk)
+            VALUES (p_schema, p_table, p_schema, v_leaf,
+                    p_lower, p_upper, i, v_chunk)
+            RETURNING chunk_id INTO v_id;
+            INSERT INTO pgseries.chunk_lease (chunk_id, state)
+            VALUES (v_id, 'pending');
+            PERFORM pgseries._lease_transition(p_schema, v_leaf, 'ready');
+        END LOOP;
+    ELSE
+        INSERT INTO pgseries.chunk
+            (series_schema, series_table, chunk_schema, chunk_name,
+             range_lower, range_upper, space_index, parent_chunk)
+        VALUES (p_schema, p_table, p_schema, v_chunk,
+                p_lower, p_upper, 0, v_chunk)
+        RETURNING chunk_id INTO v_id;
+        INSERT INTO pgseries.chunk_lease (chunk_id, state)
+        VALUES (v_id, 'pending');
+        PERFORM pgseries._lease_transition(p_schema, v_chunk, 'ready');
+    END IF;
     RETURN v_chunk;
 END;
 $$;
@@ -794,6 +902,20 @@ BEGIN
     VALUES (p_schema, p_table, p_time_column, 'time', 1);
 
     -- Register every attached leaf (except DEFAULT) without moving data.
+    -- Multi-level sources are refused: sub-partitioned children would
+    -- register as single chunks (wrong granularity); adopt the top
+    -- level of a 1-level table, or add_dimension() afterwards.
+    IF EXISTS (SELECT 1
+               FROM pg_inherits inh
+               JOIN pg_class par ON par.oid = inh.inhparent
+               JOIN pg_namespace pn ON pn.oid = par.relnamespace
+               JOIN pg_class cc ON cc.oid = inh.inhrelid
+               WHERE pn.nspname = p_schema::TEXT AND par.relname = p_table::TEXT
+                 AND cc.relkind = 'p') THEN
+        RAISE EXCEPTION 'pgseries: %.% has sub-partitioned children; adopt 1-level tables only',
+            p_schema, p_table
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
     FOR r IN
         SELECT cn.nspname AS cschema, cc.relname AS cname,
                pg_get_expr(cc.relpartbound, cc.oid) AS bnd
@@ -823,8 +945,9 @@ BEGIN
         END;
         INSERT INTO pgseries.chunk
             (series_schema, series_table, chunk_schema, chunk_name,
-             range_lower, range_upper, space_index)
-        VALUES (p_schema, p_table, r.cschema, r.cname, v_lo, v_hi, 0)
+             range_lower, range_upper, space_index, parent_chunk)
+        VALUES (p_schema, p_table, r.cschema, r.cname, v_lo, v_hi, 0,
+                r.cname)
         ON CONFLICT (chunk_schema, chunk_name) DO NOTHING
         RETURNING chunk_id INTO v_id;
         IF FOUND THEN
@@ -1037,36 +1160,56 @@ AS $$
 DECLARE
     v_cutoff TIMESTAMPTZ := now() - p_older_than;
     r        RECORD;
+    v_node   TEXT := '';
+    v_cschema NAME;
 BEGIN
     PERFORM pgseries._series(p_schema, p_table);
     -- v0.3+ will refuse chunks overlapping a cagg refresh window here.
     -- No caggs are registered yet, so the check is a no-op by construction.
     PERFORM pgseries._table_lock(p_schema, p_table);
 
+    -- Leaf rows ordered so siblings are adjacent; each time-chunk node
+    -- (possibly hash-sub-partitioned) drops once with all its leaves.
+    -- Returns node names (== chunk names on single-dimension tables).
     FOR r IN
-        SELECT c.chunk_id, c.chunk_schema, c.chunk_name
+        SELECT c.chunk_id, c.chunk_schema, c.chunk_name,
+               COALESCE(c.parent_chunk, c.chunk_name) AS node
         FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id)
         WHERE c.series_schema = p_schema AND c.series_table = p_table
           AND c.range_upper IS NOT NULL AND c.range_upper < v_cutoff
           AND l.state IN ('ready', 'compressed')
-        ORDER BY c.range_upper
+        ORDER BY c.range_upper, node
         FOR UPDATE OF l
     LOOP
+        IF r.node::TEXT = v_node THEN
+            -- Sibling leaf of an already-dropped node (its catalog row
+            -- went with the node loop below; locks were taken upfront).
+            CONTINUE;
+        END IF;
+        v_node := r.node::TEXT;
+        SELECT chunk_schema INTO v_cschema FROM pgseries.chunk
+        WHERE series_schema = p_schema AND series_table = p_table
+          AND COALESCE(parent_chunk, chunk_name) = r.node
+        LIMIT 1;
         IF p_dry_run THEN
-            RETURN NEXT (r.chunk_schema::TEXT || '.' || r.chunk_name::TEXT);
+            RETURN NEXT (v_cschema::TEXT || '.' || r.node::TEXT);
             CONTINUE;
         END IF;
         PERFORM pgseries._lease_transition(
             r.chunk_schema, r.chunk_name, 'leased_for_drop');
-        EXECUTE format('DROP TABLE %I.%I', r.chunk_schema, r.chunk_name);
-        -- Compressed sibling goes with the chunk (v0.6).
-        IF to_regclass(format('%I.%I', r.chunk_schema,
-                              (r.chunk_name::TEXT || '_compressed')::NAME)) IS NOT NULL THEN
-            EXECUTE format('DROP TABLE %I.%I', r.chunk_schema,
-                           (r.chunk_name::TEXT || '_compressed')::NAME);
+        -- The node DROP cascades to hash leaves; the shared
+        -- compressed sibling goes with it.
+        EXECUTE format('DROP TABLE %I.%I', v_cschema, r.node);
+        IF to_regclass(format('%I.%I', v_cschema,
+                              (r.node::TEXT || '_compressed')::NAME)) IS NOT NULL THEN
+            EXECUTE format('DROP TABLE %I.%I', v_cschema,
+                           (r.node::TEXT || '_compressed')::NAME);
         END IF;
-        DELETE FROM pgseries.chunk WHERE chunk_id = r.chunk_id;
-        RETURN NEXT (r.chunk_schema::TEXT || '.' || r.chunk_name::TEXT);
+        DELETE FROM pgseries.chunk
+        WHERE series_schema = p_schema AND series_table = p_table
+          AND chunk_schema = v_cschema
+          AND COALESCE(parent_chunk, chunk_name) = r.node;
+        RETURN NEXT (v_cschema::TEXT || '.' || r.node::TEXT);
     END LOOP;
 END;
 $$;
@@ -1250,16 +1393,205 @@ $$;
 -- 5. Forward stubs — staged APIs, honest "not implemented"
 -- ---------------------------------------------------------------------
 
+-- Space partitioning: fan every time-chunk out into p_n hash
+-- leaves on p_column, in place and without losing rows. Each chunk is
+-- converted in turn: build a hash-partitioned twin, move rows
+-- (single DELETE+INSERT, set-based), swap names, re-attach with the
+-- original time bounds (typed literals — bare literals misfire
+-- validation with a misleading hash-leaf error, verified). New chunks
+-- fan out via _create_chunk from here on. Writes should quiesce
+-- during the call: a concurrent insert landing in DEFAULT inside the
+-- drain-attach window aborts the whole (transactional, retry-safe)
+-- conversion.
 CREATE OR REPLACE FUNCTION pgseries.add_dimension(
     p_schema NAME, p_table NAME, p_column NAME,
     p_type TEXT DEFAULT 'space_hash', p_n INTEGER DEFAULT 16)
 RETURNS VOID
 LANGUAGE plpgsql
+SECURITY DEFINER
 SET search_path = pgseries, pg_catalog
 AS $$
+DECLARE
+    s        pgseries.series_table%ROWTYPE;
+    v_wp     TEXT := pgseries._write_parent(p_schema, p_table);
+    v_coltype TEXT;
+    v_tmp    NAME;
+    v_cols   TEXT;
+    r        RECORD;
+    q        RECORD;
+    i        INTEGER;
+    v_id     INTEGER;
 BEGIN
-    RAISE EXCEPTION 'pgseries: add_dimension ships in v0.2 full (space partitioning); catalog shape is reserved'
-        USING ERRCODE = 'feature_not_supported';
+    s := pgseries._series(p_schema, p_table);
+    PERFORM pgseries._table_lock(p_schema, p_table);
+    IF p_type <> 'space_hash' THEN
+        RAISE EXCEPTION 'pgseries: space_range dimensions ship separately (space_hash only for now)'
+            USING ERRCODE = 'feature_not_supported';
+    END IF;
+    IF p_n IS NULL OR p_n < 2 OR p_n > 128 THEN
+        RAISE EXCEPTION 'pgseries: n must be between 2 and 128, got %', p_n
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    SELECT format_type(a.atttypid, NULL) INTO v_coltype
+    FROM pg_attribute a
+    WHERE a.attrelid = to_regclass(v_wp)
+      AND a.attname = p_column::TEXT AND a.attnum > 0 AND NOT a.attisdropped;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pgseries: column % does not exist on %.%',
+            p_column, p_schema, p_table
+            USING ERRCODE = 'undefined_column';
+    END IF;
+    IF p_column = s.time_column THEN
+        RAISE EXCEPTION 'pgseries: time column % cannot be a space dimension',
+            p_column
+            USING ERRCODE = 'invalid_parameter_value';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pgseries.dimension
+               WHERE series_schema = p_schema AND series_table = p_table
+                 AND dim_type <> 'time') THEN
+        RAISE EXCEPTION 'pgseries: %.% already has a space dimension (one max)',
+            p_schema, p_table
+            USING ERRCODE = 'duplicate_object';
+    END IF;
+    SELECT count(*) INTO i
+    FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id)
+    WHERE c.series_schema = p_schema AND c.series_table = p_table
+      AND l.state IN ('compressing', 'compressed');
+    IF i > 0 THEN
+        RAISE EXCEPTION 'pgseries: % compressed chunks exist; decompress_chunk them first',
+            i
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    -- Hash-partitioned leaves inherit the parent's unique indexes, so
+    -- every PK/UNIQUE must cover the space column or ATTACH fails.
+    FOR q IN
+        SELECT c.conname
+        FROM pg_constraint c
+        WHERE c.conrelid = to_regclass(v_wp)
+          AND c.contype IN ('p', 'u')
+          AND NOT EXISTS (
+              SELECT 1 FROM unnest(c.conkey) AS k(attnum)
+              JOIN pg_attribute a ON a.attrelid = c.conrelid
+                                 AND a.attnum = k.attnum
+              WHERE a.attname = p_column::TEXT)
+    LOOP
+        RAISE EXCEPTION 'pgseries: constraint % lacks the space column % (drop or redefine it first)',
+            q.conname, p_column
+            USING ERRCODE = 'invalid_parameter_value';
+    END LOOP;
+
+    INSERT INTO pgseries.dimension
+        (series_schema, series_table, dim_name, dim_type, number_partitions)
+    VALUES (p_schema, p_table, p_column, 'space_hash', p_n);
+
+    SELECT c.v_all INTO v_cols
+    FROM pgseries._copy_columns(p_schema, p_table) AS c;
+    FOR r IN SELECT c.chunk_schema, c.chunk_name,
+                    c.range_lower, c.range_upper
+             FROM pgseries.chunk c
+             WHERE c.series_schema = p_schema AND c.series_table = p_table
+             ORDER BY c.range_lower NULLS LAST LOOP
+        IF r.range_lower IS NULL OR r.range_upper IS NULL THEN
+            RAISE EXCEPTION 'pgseries: chunk %.% has unknown bounds (adopted); drop it before add_dimension',
+                r.chunk_schema, r.chunk_name
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
+        v_tmp := (r.chunk_name::TEXT || '_new')::NAME;
+        IF to_regclass(format('%I.%I', r.chunk_schema, v_tmp)) IS NOT NULL THEN
+            RAISE EXCEPTION 'pgseries: scratch name %.% already exists',
+                r.chunk_schema, v_tmp
+                USING ERRCODE = 'duplicate_table';
+        END IF;
+        EXECUTE format(
+            'CREATE TABLE %I.%I (LIKE %I.%I '
+            || 'INCLUDING DEFAULTS INCLUDING CONSTRAINTS '
+            || 'INCLUDING GENERATED INCLUDING IDENTITY) '
+            || 'PARTITION BY HASH (%I)',
+            r.chunk_schema, v_tmp, r.chunk_schema, r.chunk_name,
+            p_column);
+        -- Neither the node nor its leaves may own identity (ATTACH
+        -- rejects it); the series parent's shared identity governs,
+        -- same rule as _create_chunk.
+        FOR q IN
+            SELECT a.attname FROM pg_attribute a
+            WHERE a.attrelid = to_regclass(
+                      format('%I.%I', r.chunk_schema, v_tmp))
+              AND a.attidentity <> ''
+        LOOP
+            EXECUTE format('ALTER TABLE %I.%I ALTER COLUMN %I DROP IDENTITY',
+                r.chunk_schema, v_tmp, q.attname);
+        END LOOP;
+        PERFORM pgseries._subpartition_node(
+            r.chunk_schema, v_tmp, p_column, p_n);
+        EXECUTE format(
+            'WITH moved AS (DELETE FROM %I.%I RETURNING *) '
+            || 'INSERT INTO %I.%I (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM moved',
+            r.chunk_schema, r.chunk_name,
+            r.chunk_schema, v_tmp, v_cols, v_cols);
+        -- Concurrent arrivals stashed in DEFAULT meanwhile: drain first
+        -- so the ATTACH validation scan passes.
+        EXECUTE format(
+            'WITH moved AS (DELETE FROM %I.%I '
+            || 'WHERE %I >= %L::%s AND %I < %L::%s RETURNING *) '
+            || 'INSERT INTO %I.%I (%s) OVERRIDING SYSTEM VALUE SELECT %s FROM moved',
+            p_schema, pgseries._default_name(p_table),
+            s.time_column, r.range_lower::TEXT, s.time_col_type,
+            s.time_column, r.range_upper::TEXT, s.time_col_type,
+            r.chunk_schema, v_tmp, v_cols, v_cols);
+        EXECUTE format('ALTER TABLE %s DETACH PARTITION %I.%I',
+            v_wp, r.chunk_schema, r.chunk_name);
+        EXECUTE format('DROP TABLE %I.%I', r.chunk_schema, r.chunk_name);
+        EXECUTE format('ALTER TABLE %I.%I RENAME TO %I',
+            r.chunk_schema, v_tmp, r.chunk_name);
+        -- Leaves keep their scratch names on RENAME; fix them so the
+        -- catalog (<node>_s<i>) matches reality.
+        FOR i IN 0 .. p_n - 1 LOOP
+            EXECUTE format('ALTER TABLE %I.%I RENAME TO %I',
+                r.chunk_schema,
+                (r.chunk_name::TEXT || '_new_s' || i)::NAME,
+                (r.chunk_name::TEXT || '_s' || i)::NAME);
+        END LOOP;
+        EXECUTE format(
+            'ALTER TABLE %s ATTACH PARTITION %I.%I '
+            || 'FOR VALUES FROM (%L::%s) TO (%L::%s)',
+            v_wp, r.chunk_schema, r.chunk_name,
+            r.range_lower::TEXT, s.time_col_type,
+            r.range_upper::TEXT, s.time_col_type);
+        -- The pre-dim 1-level sibling (if any) is vacated: every
+        -- chunk here is ready/compressed-free by the guard above, so
+        -- its sibling holds zero segments; fail loudly otherwise.
+        IF to_regclass(format('%I.%I', r.chunk_schema,
+                               (r.chunk_name::TEXT || '_compressed')::NAME))
+           IS NOT NULL THEN
+            EXECUTE format('SELECT count(*) FROM %I.%I',
+                r.chunk_schema,
+                (r.chunk_name::TEXT || '_compressed')::NAME)
+            INTO v_id;
+            IF v_id > 0 THEN
+                RAISE EXCEPTION 'pgseries: sibling %.% is not empty; decompress first',
+                    r.chunk_schema,
+                    (r.chunk_name::TEXT || '_compressed')::NAME
+                    USING ERRCODE = 'object_not_in_prerequisite_state';
+            END IF;
+            EXECUTE format('DROP TABLE %I.%I',
+                r.chunk_schema,
+                (r.chunk_name::TEXT || '_compressed')::NAME);
+        END IF;
+        DELETE FROM pgseries.chunk
+        WHERE series_schema = p_schema AND series_table = p_table
+          AND chunk_schema = r.chunk_schema AND chunk_name = r.chunk_name;
+        FOR i IN 0 .. p_n - 1 LOOP
+            INSERT INTO pgseries.chunk
+                (series_schema, series_table, chunk_schema, chunk_name,
+                 range_lower, range_upper, space_index, parent_chunk)
+            VALUES (p_schema, p_table, r.chunk_schema,
+                    (r.chunk_name::TEXT || '_s' || i)::NAME,
+                    r.range_lower, r.range_upper, i, r.chunk_name)
+            RETURNING chunk_id INTO v_id;
+            INSERT INTO pgseries.chunk_lease (chunk_id, state)
+            VALUES (v_id, 'ready');
+        END LOOP;
+    END LOOP;
 END;
 $$;
 
@@ -2014,6 +2346,8 @@ DECLARE
     v_state  TEXT;
     v_lo     TIMESTAMPTZ;
     v_hi     TIMESTAMPTZ;
+    v_node   NAME;
+    v_space  INTEGER;
     v_cpart  NAME;
     v_tpl    TEXT := format('%I.%I', p_schema, p_table || '_compressed');
     v_heap   BIGINT;
@@ -2029,8 +2363,9 @@ BEGIN
             p_schema, p_table
             USING ERRCODE = 'undefined_object';
     END IF;
-    SELECT l.state, c.range_lower, c.range_upper
-    INTO v_state, v_lo, v_hi
+    SELECT l.state, c.range_lower, c.range_upper,
+           COALESCE(c.parent_chunk, c.chunk_name), c.space_index
+    INTO v_state, v_lo, v_hi, v_node, v_space
     FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id)
     WHERE c.chunk_schema = p_schema AND c.chunk_name = p_chunk
     FOR UPDATE OF l;
@@ -2052,7 +2387,10 @@ BEGIN
 
     EXECUTE format('SELECT count(*) FROM %I.%I', p_schema, p_chunk)
     INTO v_heap;
-    v_cpart := (p_chunk::TEXT || '_compressed')::NAME;
+    -- One compressed partition per time-chunk node, shared by its
+    -- space leaves (seg_space tells slices apart); single-dimension
+    -- tables: node == chunk, identical behavior to before.
+    v_cpart := (v_node::TEXT || '_compressed')::NAME;
     -- Cold AND big enough: below one segment's worth of rows the
     -- per-segment overhead dominates (measured: a 500-row chunk grew
     -- 64 kB -> 136 kB). Skipped chunks stay ready for a later tick.
@@ -2094,7 +2432,8 @@ BEGIN
     EXECUTE 'SET LOCAL pgseries.allow_compressed_write = ''on''';
     SELECT pgseries._pack_segments(p_schema, p_chunk, p_schema, v_cpart,
         s.time_column, s.time_col_type, pol.segmentby, pol.orderby,
-        pol.orderby_desc, pol.segment_rows, pol.codecs, pol.requant)
+        pol.orderby_desc, pol.segment_rows, pol.codecs, pol.requant,
+        '', NULL, v_space)
     INTO v_segs;
     EXECUTE format('TRUNCATE %I.%I', p_schema, p_chunk);
     PERFORM pgseries._lease_transition(p_schema, p_chunk, 'compressed');
@@ -2157,6 +2496,7 @@ DECLARE
     v_cpart  NAME;
     v_minrows INTEGER;
     v_skipped INTEGER;
+    v_hasdim BOOLEAN;
     r        RECORD;
 BEGIN
     s := pgseries._series(p_schema, p_table);
@@ -2176,13 +2516,18 @@ BEGIN
     v_cutoff := CASE WHEN p_older_than IS NULL THEN NULL
                      ELSE now() - p_older_than END;
 
-    CREATE TEMP TABLE IF NOT EXISTS pgseries_compress_list (
-        cn NAME PRIMARY KEY,
-        lo TIMESTAMPTZ NOT NULL, hi TIMESTAMPTZ NOT NULL,
-        heap_n BIGINT NOT NULL DEFAULT -1) ON COMMIT DROP;
+    IF to_regclass('pg_temp.pgseries_compress_list') IS NULL THEN
+        CREATE TEMP TABLE pgseries_compress_list (
+            cn NAME PRIMARY KEY,
+            lo TIMESTAMPTZ NOT NULL, hi TIMESTAMPTZ NOT NULL,
+            sp INTEGER NOT NULL DEFAULT 0,
+            node NAME NOT NULL,
+            heap_n BIGINT NOT NULL DEFAULT -1) ON COMMIT DROP;
+    END IF;
     DELETE FROM pgseries_compress_list;
-    INSERT INTO pgseries_compress_list (cn, lo, hi)
-    SELECT c.chunk_name, c.range_lower, c.range_upper
+    INSERT INTO pgseries_compress_list (cn, lo, hi, sp, node)
+    SELECT c.chunk_name, c.range_lower, c.range_upper,
+           c.space_index, COALESCE(c.parent_chunk, c.chunk_name)
     FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id)
     WHERE c.series_schema = p_schema AND c.series_table = p_table
       AND l.state = 'ready'
@@ -2227,9 +2572,11 @@ BEGIN
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
 
-    -- Compressed partitions up front (DDL per chunk; names only).
-    FOR r IN SELECT * FROM pgseries_compress_list ORDER BY lo LOOP
-        v_cpart := (r.cn::TEXT || '_compressed')::NAME;
+    -- Compressed partitions up front, one per time-chunk node shared
+    -- by its space leaves (DDL per node; names only).
+    FOR r IN SELECT DISTINCT node, min(lo) AS lo, max(hi) AS hi
+             FROM pgseries_compress_list GROUP BY node ORDER BY 2 LOOP
+        v_cpart := (r.node::TEXT || '_compressed')::NAME;
         IF to_regclass(format('%I.%I', p_schema, v_cpart)) IS NULL THEN
             EXECUTE format('CREATE TABLE %I.%I PARTITION OF %s '
                            || 'FOR VALUES FROM (%L::TIMESTAMPTZ) TO (%L::TIMESTAMPTZ)',
@@ -2258,12 +2605,32 @@ BEGIN
         s.time_column, v_min, s.time_column, v_max, v_bucket);
 
     EXECUTE 'SET LOCAL pgseries.allow_compressed_write = ''on''';
-    SELECT pgseries._pack_segments(p_schema, v_heap, p_schema,
-        (p_table || '_compressed')::NAME,
-        s.time_column, s.time_col_type, pol.segmentby, pol.orderby,
-        pol.orderby_desc, pol.segment_rows, pol.codecs, pol.requant,
-        v_where, v_bucket)
-    INTO v_nsegs;
+    SELECT EXISTS (SELECT 1 FROM pgseries.dimension
+                   WHERE series_schema = p_schema
+                     AND series_table = p_table
+                     AND dim_type = 'space_hash')
+    INTO v_hasdim;
+    IF NOT v_hasdim THEN
+        SELECT pgseries._pack_segments(p_schema, v_heap, p_schema,
+            (p_table || '_compressed')::NAME,
+            s.time_column, s.time_col_type, pol.segmentby, pol.orderby,
+            pol.orderby_desc, pol.segment_rows, pol.codecs, pol.requant,
+            v_where, v_bucket, 0)
+        INTO v_nsegs;
+    ELSE
+        -- One set-based pack per leaf straight into its node's shared
+        -- sibling (space slices never mix: seg_space stays exact).
+        v_nsegs := 0;
+        FOR r IN SELECT * FROM pgseries_compress_list ORDER BY lo, sp LOOP
+            v_cpart := (r.node::TEXT || '_compressed')::NAME;
+            SELECT pgseries._pack_segments(p_schema, r.cn, p_schema, v_cpart,
+                s.time_column, s.time_col_type, pol.segmentby, pol.orderby,
+                pol.orderby_desc, pol.segment_rows, pol.codecs, pol.requant,
+                '', NULL, r.sp)
+            INTO v_n;
+            v_nsegs := v_nsegs + v_n;
+        END LOOP;
+    END IF;
 
     -- Heaps drained (one TRUNCATE per chunk; DDL, no scans), leases out.
     FOR r IN SELECT * FROM pgseries_compress_list ORDER BY lo LOOP
@@ -2313,13 +2680,17 @@ AS $$
 DECLARE
     s       pgseries.series_table%ROWTYPE;
     v_state TEXT;
+    v_space INTEGER;
+    v_node  NAME;
     v_cpart NAME;
     v_cols  TEXT;
     v_n     BIGINT;
+    v_left  BIGINT;
     v_unpack TEXT := 'pgseries.unpack_' || pgseries._slug(p_schema, p_table);
 BEGIN
     s := pgseries._series(p_schema, p_table);
-    SELECT l.state INTO v_state
+    SELECT l.state, c.space_index, COALESCE(c.parent_chunk, c.chunk_name)
+    INTO v_state, v_space, v_node
     FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id)
     WHERE c.chunk_schema = p_schema AND c.chunk_name = p_chunk
     FOR UPDATE OF l;
@@ -2333,7 +2704,9 @@ BEGIN
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
     PERFORM pgseries._table_lock(p_schema, p_table);
-    v_cpart := (p_chunk::TEXT || '_compressed')::NAME;
+    -- Shared node sibling: only this leaf's slice (seg_space) moves
+    -- back; the node goes away only when no slice remains.
+    v_cpart := (v_node::TEXT || '_compressed')::NAME;
     IF to_regclass(format('%I.%I', p_schema, v_cpart)) IS NULL THEN
         RAISE EXCEPTION 'pgseries: compressed partition %.% missing', p_schema, v_cpart
             USING ERRCODE = 'undefined_object';
@@ -2344,10 +2717,17 @@ BEGIN
     SELECT c.v_all INTO v_cols
     FROM pgseries._copy_columns(p_schema, p_table) AS c;
     EXECUTE format('INSERT INTO %I.%I (%s) OVERRIDING SYSTEM VALUE '
-                   || 'SELECT %s FROM (SELECT (%s(c)).* FROM %I.%I AS c) AS s',
-        p_schema, p_chunk, v_cols, v_cols, v_unpack, p_schema, v_cpart);
+                   || 'SELECT %s FROM (SELECT (%s(c)).* FROM %I.%I AS c '
+                   || 'WHERE c.seg_space = %s) AS s',
+        p_schema, p_chunk, v_cols, v_cols, v_unpack, p_schema, v_cpart, v_space);
     GET DIAGNOSTICS v_n = ROW_COUNT;
-    EXECUTE format('TRUNCATE %I.%I', p_schema, v_cpart);
+    EXECUTE format('DELETE FROM %I.%I WHERE seg_space = %s',
+        p_schema, v_cpart, v_space);
+    EXECUTE format('SELECT count(*) FROM %I.%I', p_schema, v_cpart)
+    INTO v_left;
+    IF v_left = 0 THEN
+        EXECUTE format('DROP TABLE %I.%I', p_schema, v_cpart);
+    END IF;
     EXECUTE format('ANALYZE %I.%I', p_schema, p_chunk);
     RETURN format('decompressed %s rows into %I', v_n, p_chunk);
 END;
@@ -2529,8 +2909,10 @@ BEGIN
         v_rel    BIGINT;
         v_stats_hit BOOLEAN := false;
     BEGIN
-        CREATE TEMP TABLE IF NOT EXISTS suggest_nd (col NAME PRIMARY KEY, nd BIGINT)
-            ON COMMIT DROP;
+        IF to_regclass('pg_temp.suggest_nd') IS NULL THEN
+            CREATE TEMP TABLE suggest_nd (col NAME PRIMARY KEY, nd BIGINT)
+                ON COMMIT DROP;
+        END IF;
         DELETE FROM suggest_nd;
         SELECT reltuples::BIGINT INTO v_rel FROM pg_class
         WHERE oid = to_regclass(v_heapq);
@@ -2880,13 +3262,17 @@ $$;
 DROP FUNCTION IF EXISTS pgseries._pack_segments(
     NAME, NAME, NAME, NAME, NAME, TEXT, NAME[], NAME, BOOLEAN,
     INTEGER, JSONB, JSONB);
+DROP FUNCTION IF EXISTS pgseries._pack_segments(
+    NAME, NAME, NAME, NAME, NAME, TEXT, NAME[], NAME, BOOLEAN,
+    INTEGER, JSONB, JSONB, TEXT, TEXT);
 CREATE OR REPLACE FUNCTION pgseries._pack_segments(
     p_src_schema NAME, p_src_table NAME,
     p_tgt_schema NAME, p_tgt_table NAME,
     p_timecol NAME, p_timecol_type TEXT,
     p_segmentby NAME[], p_orderby NAME, p_ob_desc BOOLEAN,
     p_segment_rows INTEGER, p_codecs JSONB, p_requant JSONB,
-    p_where TEXT DEFAULT '', p_bucket TEXT DEFAULT NULL)
+    p_where TEXT DEFAULT '', p_bucket TEXT DEFAULT NULL,
+    p_space INTEGER DEFAULT 0)
 RETURNS BIGINT
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -2978,9 +3364,9 @@ BEGIN
         || 'l2 AS (SELECT %s, min(%I) AS _lo, max(%I) AS _hi, '
         || 'count(*) AS _n%s FROM l1 GROUP BY %s) '
         || 'INSERT INTO %I.%I (seg_no, seg_min_ts, seg_max_ts, '
-        || 'seg_row_count%s) '
+        || 'seg_row_count, seg_space%s) '
         || 'SELECT row_number() OVER (ORDER BY %s), '
-        || '_lo::TIMESTAMPTZ, _hi::TIMESTAMPTZ, _n%s '
+        || '_lo::TIMESTAMPTZ, _hi::TIMESTAMPTZ, _n, %s%s '
         || 'FROM l2',
         v_win,
         CASE WHEN p_bucket IS NULL THEN '' ELSE format(', (%s) AS _bkt', p_bucket) END,
@@ -2990,7 +3376,7 @@ BEGIN
         v_l2key, p_timecol, p_timecol, v_l2arr,
         v_l2key,
         p_tgt_schema, p_tgt_table, v_ins,
-        v_l2key,
+        v_l2key, p_space,
         v_l3sel);
     GET DIAGNOSTICS v_n = ROW_COUNT;
     RETURN v_n;
@@ -3286,7 +3672,8 @@ BEGIN
     v_defs := v_defs || ', seg_no INTEGER, '
         || 'seg_min_ts TIMESTAMPTZ NOT NULL, '
         || 'seg_max_ts TIMESTAMPTZ NOT NULL, '
-        || 'seg_row_count INTEGER NOT NULL';
+        || 'seg_row_count INTEGER NOT NULL, '
+        || 'seg_space INTEGER NOT NULL DEFAULT 0';
 
     RETURN NEXT format('CREATE TABLE %s (%s)%s', p_target, v_defs,
         CASE WHEN p_partitioned THEN ' PARTITION BY RANGE (seg_min_ts)'
@@ -3343,11 +3730,13 @@ SELECT series_schema, series_table, time_column, time_col_type,
        chunk_interval, origin, created_at
 FROM pgseries.series_table;
 
+-- parent_chunk appended last: CREATE OR REPLACE VIEW cannot change
+-- middle column names on upgrade (existing installs).
 CREATE OR REPLACE VIEW pgseries_information.chunks AS
 SELECT c.series_schema, c.series_table,
        c.chunk_schema, c.chunk_name,
-       c.range_lower, c.range_upper, c.space_index, l.state,
-       c.created_at
+       c.range_lower, c.range_upper, c.space_index,
+       l.state, c.created_at, c.parent_chunk
 FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id);
 
 CREATE OR REPLACE VIEW pgseries_information.dimensions AS
@@ -3380,13 +3769,23 @@ DECLARE
     v_sql TEXT;
 BEGIN
     PERFORM pgseries._series(p_schema, p_table);
-    CREATE TEMP TABLE IF NOT EXISTS pgseries_stats_heap (cn NAME PRIMARY KEY, n BIGINT)
-        ON COMMIT DROP;
+    IF to_regclass('pg_temp.pgseries_stats_heap') IS NULL THEN
+        CREATE TEMP TABLE pgseries_stats_heap (cn NAME PRIMARY KEY, n BIGINT)
+            ON COMMIT DROP;
+    END IF;
     DELETE FROM pgseries_stats_heap;
-    CREATE TEMP TABLE IF NOT EXISTS pgseries_stats_comp (
-        cn NAME PRIMARY KEY, segs BIGINT, crows BIGINT, cbytes BIGINT)
-        ON COMMIT DROP;
+    IF to_regclass('pg_temp.pgseries_stats_comp') IS NULL THEN
+        CREATE TEMP TABLE pgseries_stats_comp (
+            cn NAME PRIMARY KEY, segs BIGINT, crows BIGINT, cbytes BIGINT)
+            ON COMMIT DROP;
+    END IF;
     DELETE FROM pgseries_stats_comp;
+    IF to_regclass('pg_temp.pgseries_stats_node') IS NULL THEN
+        CREATE TEMP TABLE pgseries_stats_node (
+            node NAME PRIMARY KEY, nrows BIGINT, nbytes BIGINT)
+            ON COMMIT DROP;
+    END IF;
+    DELETE FROM pgseries_stats_node;
 
     SELECT string_agg(
                format('SELECT %L::NAME AS cn, count(*) AS n FROM %I.%I',
@@ -3399,24 +3798,45 @@ BEGIN
         EXECUTE 'INSERT INTO pgseries_stats_heap ' || v_sql;
     END IF;
 
+    -- Per-leaf slice of the shared node sibling (seg_space), one
+    -- UNION ALL for all leaves. Bytes are node totals split
+    -- proportionally to slice rows (estimate — TOAST is shared).
     SELECT string_agg(
                format('SELECT %L::NAME AS cn, count(*) AS segs, '
                       || 'COALESCE(sum(seg_row_count), 0) AS crows '
-                      || 'FROM %I.%I',
+                      || 'FROM %I.%I WHERE seg_space = %s',
                       c.chunk_name, c.chunk_schema,
-                      (c.chunk_name::TEXT || '_compressed')::NAME),
+                      (COALESCE(c.parent_chunk, c.chunk_name)::TEXT
+                       || '_compressed')::NAME,
+                      c.space_index),
                ' UNION ALL ')
     INTO v_sql
     FROM pgseries.chunk c
     WHERE c.series_schema = p_schema AND c.series_table = p_table
       AND to_regclass(format('%I.%I', c.chunk_schema,
-                             (c.chunk_name::TEXT || '_compressed')::NAME))
+                             (COALESCE(c.parent_chunk, c.chunk_name)::TEXT
+                              || '_compressed')::NAME))
           IS NOT NULL;
     IF v_sql IS NOT NULL THEN
         EXECUTE 'INSERT INTO pgseries_stats_comp (cn, segs, crows) ' || v_sql;
-        UPDATE pgseries_stats_comp s SET cbytes = pg_total_relation_size(k.oid)
-        FROM pg_class k
-        WHERE k.relname = s.cn::TEXT || '_compressed';
+        INSERT INTO pgseries_stats_node (node, nrows, nbytes)
+        SELECT COALESCE(c.parent_chunk, c.chunk_name),
+               sum(s2.crows),
+               pg_total_relation_size(to_regclass(format(
+                   '%I.%I', c.chunk_schema,
+                   (COALESCE(c.parent_chunk, c.chunk_name)::TEXT
+                    || '_compressed')::NAME)))
+        FROM pgseries.chunk c
+        JOIN pgseries_stats_comp s2 ON s2.cn = c.chunk_name
+        WHERE c.series_schema = p_schema AND c.series_table = p_table
+        GROUP BY 1, c.chunk_schema;
+        UPDATE pgseries_stats_comp s
+        SET cbytes = (n.nbytes * s.crows / NULLIF(n.nrows, 0))::BIGINT
+        FROM pgseries.chunk c
+        JOIN pgseries_stats_node n
+          ON n.node = COALESCE(c.parent_chunk, c.chunk_name)
+        WHERE c.series_schema = p_schema AND c.series_table = p_table
+          AND s.cn = c.chunk_name;
     END IF;
 
     RETURN QUERY

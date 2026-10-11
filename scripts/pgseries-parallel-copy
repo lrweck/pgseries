@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# pgseries-parallel-copy: sharded bulk load via N parallel COPY streams.
+# Splits stdin (or a file) into N line-chunks and COPYs each into the
+# series table concurrently. The server routes every row (works pre-
+# and post-add_dimension; with a space dimension the streams fan out
+# across hash leaves naturally, which is where the throughput comes
+# from — TimescaleDB's parallel-copy benchmarks lean on the same
+# effect). Per-stream self-throttling: none, add `pv -L` if needed.
+#
+# Usage: ./pgseries-parallel-copy CONNINFO SCHEMA.TABLE N [FILE]
+#   ./pgseries-parallel-copy "host=/sock dbname=demo" public.m1 8 data.csv < data.csv
+#   (without FILE, reads stdin)
+set -euo pipefail
+
+CONN="${1:?conninfo}"; TBL="${2:?schema.table}"; N="${3:?streams}"
+SRC="${4:-/dev/stdin}"
+command -v psql >/dev/null || { echo "psql missing" >&2; exit 1; }
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp/opencode}/pcopy.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+# Round-robin line split so each stream gets a fair time spread.
+split -n "l/$N" --numeric-suffixes=1 --additional-suffix=.csv "$SRC" "$WORK/p" \
+  || { echo "split failed (need GNU coreutils >= 8.22)" >&2; exit 1; }
+
+echo "loading $N streams into $TBL ..."
+for f in "$WORK"/p*.csv; do
+  psql "$CONN" -v ON_ERROR_STOP=1 -c "\copy $TBL FROM '$f' WITH (FORMAT csv)" \
+    >"$f.log" 2>&1 &
+done
+FAIL=0
+for job in $(jobs -p); do wait "$job" || FAIL=1; done
+grep -h COPY "$WORK"/p*.log | tail -n "$N"
+[ "$FAIL" = 0 ] || { echo "a stream failed (see $WORK, kept on error)"; trap - EXIT; exit 1; }
+echo "done."
