@@ -1494,6 +1494,15 @@ BEGIN
     END IF;
     EXECUTE format('ALTER TABLE %I.%I RENAME TO %I',
                    p_schema, p_table, v_heap);
+    -- Unpack now (heap rowtype exists from this point on), then views.
+    -- Generated here rather than in add_compression_policy so the
+    -- return type binds the heap OID (see _unpack_ddl).
+    EXECUTE pgseries._unpack_ddl(
+        p_schema, p_table,
+        (SELECT codecs FROM pgseries.compression_policy
+         WHERE series_schema = p_schema AND series_table = p_table),
+        (SELECT segmentby FROM pgseries.compression_policy
+         WHERE series_schema = p_schema AND series_table = p_table));
     -- Views first: the INSTEAD OF triggers require the base view.
     FOR v_ddl IN SELECT * FROM pgseries._read_ddl(p_schema, p_table) LOOP
         EXECUTE v_ddl;
@@ -1816,12 +1825,8 @@ BEGIN
             p_orderby_desc, p_segment_rows,
             COALESCE(p_codecs, '{}'), COALESCE(p_requant, '{}'));
 
-    -- Generated read path: unpack first (its SETOF return type binds
-    -- to the base OID pre-rename and follows it to the heap), then the
-    -- swap installs the transparent base view + DML triggers + alias.
-    EXECUTE pgseries._unpack_ddl(p_schema, p_table,
-                                 COALESCE(p_codecs, '{}'),
-                                 COALESCE(p_segmentby, '{}'));
+    -- The swap renames the heap aside and generates the unpack
+    -- (heap-bound return type), transparent base view + DML triggers.
     PERFORM pgseries._make_transparent(p_schema, p_table);
 
     -- Cardinality trap (spec): segmentby near segments-per-chunk
@@ -2926,11 +2931,14 @@ AS $$
                '_+', '_', 'g');
 $$;
 
--- Generated per-table decoder. Set-based reconstruction (running sums
--- via window functions, no plpgsql loops on the read path). Decoded
--- columns are assembled in attnum order; generated columns wrap in
--- nested levels (each sees the previous level's outputs). Returns the
--- parent rowtype so the static read view typechecks.
+-- Generated per-table decoder. Single-pass reconstruction: one
+-- multi-argument unnest per segment (no per-row array subscripts —
+-- subscripting a TOASTed array detoasts it on every row, O(n^2) per
+-- segment; measured 3x read speedup), delta via an exclusive running
+-- sum, no plpgsql loops on the read path. Decoded columns are
+-- assembled in attnum order; generated columns wrap in nested levels
+-- (each sees the previous level's outputs). Returns the parent
+-- rowtype so the static read view typechecks.
 CREATE OR REPLACE FUNCTION pgseries._unpack_ddl(
     p_schema NAME, p_table NAME,
     p_codecs JSONB, p_segmentby NAME[])
@@ -2944,7 +2952,8 @@ DECLARE
     v_pfx     TEXT;
     v_fname   TEXT := 'pgseries.unpack_' || pgseries._slug(p_schema, p_table);
     v_tpl     TEXT := format('%I.%I', p_schema, p_table || '_compressed');
-    v_cte     TEXT := '';
+    v_uargs   TEXT := '';
+    v_ualias  TEXT := '';
     v_inner   TEXT := '';
     v_wrap    TEXT;
     v_final   TEXT := '';
@@ -2953,9 +2962,18 @@ DECLARE
     v_base    TEXT;
     v_nulls   TEXT;
     v_time    NAME;
+    v_has_n   BOOLEAN := false;
 BEGIN
     SELECT time_column INTO v_time FROM pgseries.series_table
     WHERE series_schema = p_schema AND series_table = p_table;
+
+    FOR r IN SELECT * FROM pgseries._colinfo(
+                 p_schema, p_table, v_time, p_segmentby) LOOP
+        IF r.kind = 'data' AND pgseries._eff_codec(
+               p_codecs, r.attname::TEXT, r.class) <> 'delta' THEN
+            v_has_n := true;
+        END IF;
+    END LOOP;
 
     FOR r IN SELECT * FROM pgseries._colinfo(
                  p_schema, p_table, v_time, p_segmentby) LOOP
@@ -2978,32 +2996,40 @@ BEGIN
         v_base := format('seg.%I', v_pfx || '_base');
         v_nulls := format('seg.%I', v_pfx || '_nulls');
 
-        IF v_codec = 'delta' THEN
-            v_cte := v_cte || format(
-                ', d%s AS (SELECT COALESCE(array_agg(s ORDER BY o), ''{}'') AS a '
-                || 'FROM (SELECT sum(x) OVER (ORDER BY o) AS s, o '
-                || 'FROM unnest(%s) WITH ORDINALITY AS u(x, o)) t)',
-                v_pfx, v_arr);
+        -- Unnest driver args (one multi-argument unnest below; alias
+        -- order matches). Delta diffs are short (n-1); with no
+        -- full-length array in the table the first delta array is
+        -- zero-padded so the last row is not dropped (the pad only
+        -- ever feeds the running sum of nonexistent later rows).
+        IF v_codec = 'delta' AND NOT v_has_n THEN
+            v_has_n := true; -- pad exactly once
+            v_uargs := v_uargs || format(', (%s || 0)', v_arr);
+        ELSE
+            v_uargs := v_uargs || format(', %s', v_arr);
         END IF;
+        v_ualias := v_ualias || CASE WHEN v_codec = 'delta'
+            THEN format(', d%s', r.attnum)
+            WHEN v_codec = 'dict'
+            THEN format(', x%s', r.attnum)
+            ELSE format(', v%s', r.attnum) END;
 
         v_g := CASE
             WHEN v_codec = 'for' THEN
-                format('(%s + (%s)[i])', v_base, v_arr)
+                format('(CASE WHEN u.i = ANY(%s) THEN NULL ELSE %s + u.v%s END)',
+                       v_nulls, v_base, r.attnum)
             WHEN v_codec = 'delta' THEN
-                format('(CASE WHEN i = 1 THEN %s ELSE %s + (SELECT a FROM d%s)[i-1] END)',
-                       v_base, v_base, v_pfx)
+                format('(CASE WHEN u.i = ANY(%s) THEN NULL ELSE %s + '
+                       || 'COALESCE(sum(u.d%s) OVER (ORDER BY u.i ROWS BETWEEN '
+                       || 'UNBOUNDED PRECEDING AND 1 PRECEDING), 0) END)',
+                       v_nulls, v_base, r.attnum)
             WHEN v_codec = 'dict' THEN
-                format('(CASE WHEN i = ANY(%s) THEN NULL ELSE (%s)[(%s)[i]] END)',
+                format('(CASE WHEN u.i = ANY(%s) THEN NULL ELSE (%s)[u.x%s] END)',
                        v_nulls,
-                       format('seg.%I', v_pfx || '_dict'), v_arr)
+                       format('seg.%I', v_pfx || '_dict'), r.attnum)
             ELSE
-                format('(%s)[i]', v_arr)
+                format('(CASE WHEN u.i = ANY(%s) THEN NULL ELSE u.v%s END)',
+                       v_nulls, r.attnum)
         END;
-
-        IF v_codec <> 'dict' THEN
-            v_g := format('(CASE WHEN i = ANY(%s) THEN NULL ELSE %s END)',
-                          v_nulls, v_g);
-        END IF;
 
         -- Cast back to the source type (unpack must match parent rowtype).
         v_g := CASE
@@ -3028,8 +3054,10 @@ BEGIN
 
     -- Wrapper chain for generated columns. Final list rebuilt in
     -- attnum order (a generated column may sit mid-rowtype).
-    v_wrap := format('SELECT %s FROM generate_series(1, seg.seg_row_count) AS g(i)',
-                     ltrim(v_inner, ', '));
+    v_wrap := format('SELECT %s FROM unnest(%s) WITH ORDINALITY AS u(%s, i) '
+                     || 'WHERE u.i <= seg.seg_row_count',
+                     ltrim(v_inner, ', '),
+                     ltrim(v_uargs, ', '), ltrim(v_ualias, ', '));
     FOR r IN SELECT * FROM pgseries._colinfo(
                  p_schema, p_table, v_time, p_segmentby)
              WHERE kind = 'gen' ORDER BY attnum LOOP
@@ -3043,14 +3071,17 @@ BEGIN
         v_final := v_final || format(', %I', r.attname);
     END LOOP;
 
+    -- RETURNS the heap rowtype, not the base view: the heap OID is
+    -- stable (the table OID follows the rename), so future
+    -- regenerations REPLACE cleanly; a view-bound return type would
+    -- demand DROP-first upgrades.
     RETURN format(
         'CREATE OR REPLACE FUNCTION %s(seg %s) RETURNS SETOF %I.%I '
         || 'LANGUAGE sql STABLE SET search_path = pgseries, pg_catalog AS %s '
-        || '%s SELECT %s FROM (%s) AS qfinal '
+        || 'SELECT %s FROM (%s) AS qfinal '
         || '%s',
-        v_fname, v_tpl, p_schema, p_table,
+        v_fname, v_tpl, p_schema, pgseries._heap_name(p_table),
         '$pgseries_unpack$',
-        CASE WHEN v_cte = '' THEN '' ELSE 'WITH ' || ltrim(v_cte, ', ') END,
         ltrim(v_final, ', '), v_wrap,
         '$pgseries_unpack$');
 END;

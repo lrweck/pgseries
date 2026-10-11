@@ -697,4 +697,47 @@ BEGIN
     END IF;
 END $$;
 
+DO $$ BEGIN RAISE NOTICE '--- 25. for codec + all-delta unpack ---'; END $$;
+CREATE TABLE public.f1 (t TIMESTAMPTZ NOT NULL, h BIGINT);
+INSERT INTO public.f1
+SELECT '2026-02-01 00:00+00'::timestamptz + (s || ' minutes')::INTERVAL,
+       abs(hashtextextended(s::text, 0) % 1000000000)
+FROM generate_series(1, 1200) AS s;
+SELECT pgseries.create_series_table('public', 'f1', 't', '1 day');
+SELECT pgseries.move_default('public', 'f1');
+SELECT pgseries.add_compression_policy('public', 'f1', '{}', 't', false, 1000, '{"t": "delta", "h": "for"}');
+CREATE TABLE public.f1_pre AS SELECT * FROM public.f1;
+SELECT pgseries.compress_table('public', 'f1', NULL, true) AS f1_out;
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM (SELECT * FROM public.f1 EXCEPT SELECT * FROM public.f1_pre) d) <> 0 THEN
+        RAISE EXCEPTION 'for unpack diverged (plus)';
+    END IF;
+    IF (SELECT count(*) FROM (SELECT * FROM public.f1_pre EXCEPT SELECT * FROM public.f1) d) <> 0 THEN
+        RAISE EXCEPTION 'for unpack diverged (minus)';
+    END IF;
+END $$;
+-- all-delta table: no full-length array exists, exercises the || 0 pad.
+CREATE TABLE public.dd (t TIMESTAMPTZ NOT NULL, v BIGINT);
+INSERT INTO public.dd
+SELECT '2026-02-01 00:00+00'::timestamptz + (s || ' minutes')::INTERVAL, s
+FROM generate_series(1, 1200) AS s;
+SELECT pgseries.create_series_table('public', 'dd', 't', '1 day');
+SELECT pgseries.move_default('public', 'dd');
+SELECT pgseries.add_compression_policy('public', 'dd', '{}', 't', false, 1000, '{"t": "delta", "v": "delta"}');
+CREATE TABLE public.dd_pre AS SELECT * FROM public.dd;
+SELECT pgseries.compress_table('public', 'dd', NULL, true) AS dd_out;
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM (SELECT * FROM public.dd EXCEPT SELECT * FROM public.dd_pre) d) <> 0 THEN
+        RAISE EXCEPTION 'all-delta unpack diverged (plus)';
+    END IF;
+    IF (SELECT count(*) FROM (SELECT * FROM public.dd_pre EXCEPT SELECT * FROM public.dd) d) <> 0 THEN
+        RAISE EXCEPTION 'all-delta unpack diverged (minus)';
+    END IF;
+    IF (SELECT count(*) FROM public.dd) <> 1200 THEN
+        RAISE EXCEPTION 'all-delta lost rows';
+    END IF;
+END $$;
+
 SELECT 'SMOKE OK' AS result;
