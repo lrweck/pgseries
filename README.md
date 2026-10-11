@@ -71,6 +71,30 @@ seg_no | <segby…> | seg_min_ts | seg_max_ts | seg_row_count | c1_base | c1_arr
    6   |    d5    |  158 rows  |  17:12:16  |    …          | 1783023…| {86400…}|    {}    | …
 ```
 
+```mermaid
+flowchart LR
+    subgraph SEG["one _compressed row = one segment"]
+        direction LR
+        SB["<b>segmentby scalars</b><br/>device = 'd5'<br/><i>1 value each · BRIN indexed<br/>predicates skip whole segments</i>"]
+        C1["<b>c1_*</b> — ts (delta)<br/>c1_base = 1783023136692917<br/>c1_arr = [86400000 × 158]<br/>c1_nulls = {}"]
+        C3["<b>c3_*</b> — temp (raw)<br/>c3_arr = [50.59, 50.39, … × 159]<br/>c3_nulls = {}"]
+        C4["<b>c4_*</b> — cnt (delta)<br/>c4_base = 5<br/>c4_arr = [10 × 158]<br/>c4_nulls = {}"]
+        ST["<b>side stats</b><br/>seg_no · seg_min/max_ts<br/>seg_row_count = 159<br/><i>BRIN minmax_multi</i>"]
+    end
+    SEG -->|"unpack: base + diffs/offsets<br/>→ 159 heap rows, bit-exact"| ROWS[("heap rowtype")]
+    style SEG fill:#1f6feb22
+```
+
+| Physical | Holds | Length rule (audited: 0 violations / 1010 segs) |
+|---|---|---|
+| `<segby>` scalar | the group's segmentby value | 1 |
+| `cK_base` (for/delta) | first value / min | 1 |
+| `cK_arr` (raw/for/dict-idx) | all values / offsets / indices | n |
+| `cK_arr` (delta diffs) | differences (first value lives in `_base`) | n−1 |
+| `cK_dict` (dict) | per-segment distinct values | d |
+| `cK_nulls` | 1-based positions of NULLs (`{}` when none) | 0..n |
+| `seg_min/max_ts`, `seg_no`, `seg_row_count` | skipping + unpack bound | 1 |
+
 | Codec | Stores | Best for |
 |---|---|---|
 | `delta` | first value + diffs | monotonic ts / counters |
