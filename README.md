@@ -109,7 +109,12 @@ Arrays are `storage extended + compression lz4` → TOAST does the
 squeezing. Side stats + `BRIN minmax_multi_ops` on
 `(seg_min_ts, seg_max_ts)` (plus BRIN per segmentby) give data
 skipping without planner hooks; `_read_range(a, b)` pushes seg bounds
-before the `LATERAL` unnest fires.
+before the `LATERAL` unnest fires. The transparent base view goes
+further: one `UNION ALL` leg per compressed sibling, each carrying
+its chunk bounds (plus one leg per `segmentby` value when narrow)
+as statically-true quals — with `constraint_exclusion = on`,
+ranged queries prune dead legs at plan time (pure-SQL pushdown;
+see `tune()`).
 
 Two automatic guards (with `NOTICE`, stored resolved):
 

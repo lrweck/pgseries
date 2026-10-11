@@ -2421,6 +2421,88 @@ BEGIN
 END;
 $$;
 
+-- Leg fragments for one compressed node: time bounds always; when
+-- the policy has a single segmentby column with few distinct values
+-- (exact DISTINCT over the node's own segments — tiny scan, no stats
+-- staleness, no uniform-distribution hole), one leg per value plus a
+-- catch-all for the rest. Equality on u.seg lets ranged AND un-ranged
+-- segby queries prune per value at plan time (same
+-- constraint-exclusion machinery as the time legs). Multi-col
+-- segmentby or >33 distinct keeps the plain time leg.
+CREATE OR REPLACE FUNCTION pgseries._node_legs(
+    p_schema NAME, p_table NAME, p_node NAME, p_cschema NAME,
+    p_lo TIMESTAMPTZ, p_hi TIMESTAMPTZ)
+RETURNS TEXT
+LANGUAGE plpgsql STABLE
+SET search_path = pgseries, pg_catalog
+AS $$
+DECLARE
+    pol      pgseries.compression_policy%ROWTYPE;
+    s        pgseries.series_table%ROWTYPE;
+    v_unpack TEXT := 'pgseries.unpack_' || pgseries._slug(p_schema, p_table);
+    v_cpart  TEXT := format('%I.%I', p_cschema,
+                            (p_node::TEXT || '_compressed')::NAME);
+    v_seg    NAME;
+    v_segt   TEXT;
+    v_vals   TEXT[];
+    v_out    TEXT := '';
+    v        TEXT;
+BEGIN
+    SELECT * INTO pol FROM pgseries.compression_policy
+    WHERE series_schema = p_schema AND series_table = p_table;
+    IF NOT FOUND THEN
+        RETURN '';
+    END IF;
+    SELECT * INTO s FROM pgseries.series_table
+    WHERE series_schema = p_schema AND series_table = p_table;
+    IF COALESCE(array_length(pol.segmentby, 1), 0) <> 1 THEN
+        RETURN format(' UNION ALL SELECT u.* FROM %s AS c, LATERAL %s(c) AS u '
+                      || 'WHERE u.%I >= %L::%s AND u.%I < %L::%s',
+                      v_cpart, v_unpack,
+                      s.time_column, p_lo::TEXT, s.time_col_type,
+                      s.time_column, p_hi::TEXT, s.time_col_type);
+    END IF;
+    v_seg := pol.segmentby[1];
+    SELECT format_type(a.atttypid, a.atttypmod) INTO v_segt
+    FROM pg_attribute a
+    WHERE a.attrelid = to_regclass(
+              pgseries._write_parent(p_schema, p_table))
+      AND a.attname = v_seg AND a.attnum > 0 AND NOT a.attisdropped;
+    EXECUTE format('SELECT array_agg(d::TEXT) FROM '
+                   || '(SELECT DISTINCT seg.%I AS d FROM %s AS seg '
+                   || 'WHERE seg.%I IS NOT NULL LIMIT 34) t',
+                   v_seg, v_cpart, v_seg)
+    INTO v_vals;
+    -- 34 hit = 33+ distinct: keep the plain leg (conservative).
+    IF v_vals IS NULL OR array_length(v_vals, 1) IS NULL
+       OR array_length(v_vals, 1) >= 34 THEN
+        RETURN format(' UNION ALL SELECT u.* FROM %s AS c, LATERAL %s(c) AS u '
+                      || 'WHERE u.%I >= %L::%s AND u.%I < %L::%s',
+                      v_cpart, v_unpack,
+                      s.time_column, p_lo::TEXT, s.time_col_type,
+                      s.time_column, p_hi::TEXT, s.time_col_type);
+    END IF;
+    FOREACH v IN ARRAY v_vals LOOP
+        v_out := v_out || format(
+            ' UNION ALL SELECT u.* FROM %s AS c, LATERAL %s(c) AS u '
+            || 'WHERE u.%I >= %L::%s AND u.%I < %L::%s AND u.%I = %L::%s',
+            v_cpart, v_unpack,
+            s.time_column, p_lo::TEXT, s.time_col_type,
+            s.time_column, p_hi::TEXT, s.time_col_type,
+            v_seg, v, v_segt);
+    END LOOP;
+    v_out := v_out || format(
+        ' UNION ALL SELECT u.* FROM %s AS c, LATERAL %s(c) AS u '
+        || 'WHERE u.%I >= %L::%s AND u.%I < %L::%s '
+        || 'AND (u.%I <> ALL (%L::%s[]) OR u.%I IS NULL)',
+        v_cpart, v_unpack,
+        s.time_column, p_lo::TEXT, s.time_col_type,
+        s.time_column, p_hi::TEXT, s.time_col_type,
+        v_seg, v_vals, v_segt, v_seg);
+    RETURN v_out;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION pgseries._read_ddl(
     p_schema NAME, p_table NAME)
 RETURNS SETOF TEXT
@@ -2436,37 +2518,30 @@ DECLARE
     v_range TEXT := format('%I.%I', p_schema, p_table || '_read_range');
     v_legs  TEXT := '';
     v_orpha TEXT := '';
+    r       RECORD;
 BEGIN
     s := pgseries._series(p_schema, p_table);
-    -- Per-sibling legs with statically-true range quals (see below).
-    SELECT COALESCE(string_agg(
-               format(' UNION ALL SELECT u.* FROM %I.%I AS c, '
-                      || 'LATERAL %s(c) AS u '
-                      || 'WHERE u.%I >= %L::%s AND u.%I < %L::%s',
-                      legs.cschema, legs.cpart, v_unpack,
-                      s.time_column, legs.lo::TEXT, s.time_col_type,
-                      s.time_column, legs.hi::TEXT, s.time_col_type),
-               ' '), '')
-    INTO v_legs
-    FROM (SELECT t.cs AS cschema,
-                 (t.node::TEXT || '_compressed')::NAME AS cpart,
-                 min(c.range_lower) AS lo, max(c.range_upper) AS hi
-          FROM (SELECT DISTINCT COALESCE(ch.parent_chunk, ch.chunk_name) AS node,
-                                ch.chunk_schema AS cs
-                FROM pgseries.chunk ch
-                JOIN pgseries.chunk_lease lh USING (chunk_id)
-                WHERE ch.series_schema = p_schema
-                  AND ch.series_table = p_table
-                  AND lh.state IN ('compressing', 'compressed')) t
-          JOIN pgseries.chunk c
-            ON c.chunk_schema = t.cs
-           AND COALESCE(c.parent_chunk, c.chunk_name) = t.node
-           AND c.series_schema = p_schema
-           AND c.series_table = p_table
-          WHERE to_regclass(format('%I.%I', t.cs,
-                     (t.node::TEXT || '_compressed')::NAME)) IS NOT NULL
-          GROUP BY t.cs, t.node
-          HAVING min(c.range_lower) IS NOT NULL) legs;
+    -- Per-sibling legs via _node_legs (time bounds always, plus
+    -- per-value legs for narrow single-column segmentby).
+    v_legs := '';
+    FOR r IN
+        SELECT DISTINCT COALESCE(ch.parent_chunk, ch.chunk_name) AS node,
+                        ch.chunk_schema AS cs,
+                        min(ch.range_lower) AS lo, max(ch.range_upper) AS hi
+        FROM pgseries.chunk ch
+        JOIN pgseries.chunk_lease lh USING (chunk_id)
+        WHERE ch.series_schema = p_schema
+          AND ch.series_table = p_table
+          AND lh.state IN ('compressing', 'compressed')
+          AND to_regclass(format('%I.%I', ch.chunk_schema,
+                   (COALESCE(ch.parent_chunk, ch.chunk_name)::TEXT
+                    || '_compressed')::NAME)) IS NOT NULL
+        GROUP BY 1, 2
+        HAVING min(ch.range_lower) IS NOT NULL
+    LOOP
+        v_legs := v_legs || pgseries._node_legs(
+            p_schema, p_table, r.node, r.cs, r.lo, r.hi);
+    END LOOP;
     -- Siblings without catalog bounds: unprunable fallback legs
     -- (always correct, never skipped).
     SELECT COALESCE(string_agg(

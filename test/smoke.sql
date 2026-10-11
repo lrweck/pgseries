@@ -966,6 +966,14 @@ BEGIN
     IF position('u.t >=' IN v_def) = 0 THEN
         RAISE EXCEPTION 'legs carry no static time-bound quals';
     END IF;
+    -- per-value legs for the narrow segmentby (device has 3 values).
+    IF position('u.device =' IN v_def) = 0 THEN
+        RAISE EXCEPTION 'no per-value segmentby legs';
+    END IF;
+    IF (SELECT count(*) FROM public.metrics WHERE device = 'd0')
+       <> (SELECT count(*) FROM public.metrics_pre WHERE device = 'd0') THEN
+        RAISE EXCEPTION 'segby-filtered read diverged';
+    END IF;
     -- ranged reads stay exact with pruning enabled.
     SELECT count(*) INTO v_n FROM public.metrics
     WHERE t >= now() - INTERVAL '3 days' AND t <= now();
