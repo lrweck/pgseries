@@ -8,7 +8,7 @@
 \timing on
 \pset footer off
 
-DO $$ BEGIN RAISE NOTICE '--- 1. 200K pedidos, 90 dias, 11 colunas ---'; END $$;
+DO $$ BEGIN RAISE NOTICE '--- 1. 1M pedidos, 180 dias, 11 colunas ---'; END $$;
 DROP VIEW IF EXISTS public.pedidos_demo CASCADE;
 DROP TABLE IF EXISTS public.pedidos_demo CASCADE;
 CREATE TABLE public.pedidos_demo (
@@ -24,7 +24,7 @@ CREATE TABLE public.pedidos_demo (
   PRIMARY KEY (ts, loja)
 );
 INSERT INTO public.pedidos_demo
-SELECT now() - '90 days'::INTERVAL + (s || ' seconds')::INTERVAL * 39,
+SELECT now() - '180 days'::INTERVAL + (s || ' seconds')::INTERVAL * 15.552,
        7000000 + s,
        'loja-' || (1 + s % 8),
        (ARRAY['eletro','moda','casa','esporte','livros','toys',
@@ -34,7 +34,7 @@ SELECT now() - '90 days'::INTERVAL + (s || ' seconds')::INTERVAL * 39,
        (s % 4) * 2.5,
        (s % 5) <> 0,
        'entrega-' || s || '-' || md5(s::text)
-FROM generate_series(1, 200000) s;
+FROM generate_series(1, 1000000) s;
 SELECT count(*) AS linhas FROM public.pedidos_demo;
 
 DO $$ BEGIN RAISE NOTICE '--- 2. series table + mover (tudo cai no DEFAULT) ---'; END $$;
