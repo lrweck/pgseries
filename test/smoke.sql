@@ -974,9 +974,38 @@ BEGIN
     IF to_regclass('public.metrics_byseg') IS NULL THEN
         RAISE EXCEPTION 'metrics_byseg view missing';
     END IF;
+END $$;
+DO $$ BEGIN RAISE NOTICE '--- 29b. NULL segby leg ---'; END $$;
+-- NULL segby rows get their own leg (no catch-all exists).
+CREATE TABLE public.nl (t TIMESTAMPTZ NOT NULL, d TEXT, v INT);
+    INSERT INTO public.nl
+    SELECT '2026-02-01 00:00+00'::timestamptz + (s || ' minutes')::INTERVAL,
+           CASE WHEN s % 10 = 0 THEN NULL ELSE 'k' || (s % 3) END, s
+    FROM generate_series(1, 1200) AS s;
+    SELECT pgseries.create_series_table('public', 'nl', 't', '1 day');
+    SELECT pgseries.move_default('public', 'nl');
+    SELECT pgseries.add_compression_policy('public', 'nl', '{d}', 't', false, 1000, '{"t": "delta"}');
+    SELECT pgseries.compress_table('public', 'nl', NULL, true) AS nl_out;
+DO $$
+DECLARE v_def TEXT;
+BEGIN
+    SELECT pg_get_viewdef(to_regclass('public.nl_byseg')) INTO v_def;
+    IF position('IS NULL' IN v_def) = 0 THEN
+        RAISE EXCEPTION 'missing NULL segby leg';
+    END IF;
+    IF (SELECT count(*) FROM public.nl_byseg) <> 1200 THEN
+        RAISE EXCEPTION 'byseg lost rows (incl. NULLs)';
+    END IF;
+END $$;
+DO $$
+DECLARE v_def TEXT; v_n BIGINT;
+BEGIN
     SELECT pg_get_viewdef(to_regclass('public.metrics_byseg')) INTO v_def;
     IF position('u.device =' IN v_def) = 0 THEN
         RAISE EXCEPTION 'no per-value segmentby legs on _byseg';
+    END IF;
+    IF position('<> ALL' IN v_def) <> 0 THEN
+        RAISE EXCEPTION 'catch-all legs must not exist';
     END IF;
     IF (SELECT count(*) FROM public.metrics_byseg WHERE device = 'd0')
        <> (SELECT count(*) FROM public.metrics_pre WHERE device = 'd0') THEN

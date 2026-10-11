@@ -2435,11 +2435,13 @@ $$;
 -- Leg fragments for one compressed node: time bounds always; when
 -- the policy has a single segmentby column with few distinct values
 -- (exact DISTINCT over the node's own segments — tiny scan, no stats
--- staleness, no uniform-distribution hole), one leg per value plus a
--- catch-all for the rest. Equality on u.seg lets ranged AND un-ranged
--- segby queries prune per value at plan time (same
--- constraint-exclusion machinery as the time legs). Multi-col
--- segmentby or >33 distinct keeps the plain time leg.
+-- staleness, no uniform-distribution hole), one leg per value.
+-- Equality on u.seg lets ranged AND un-ranged segby queries prune
+-- per value at plan time (same constraint-exclusion machinery as
+-- the time legs). No catch-all: the list is exhaustive by
+-- construction (capped DISTINCT below its LIMIT), and NULLs get a
+-- leg only when present. Multi-col segmentby or >33 distinct keeps
+-- the plain time leg.
 CREATE OR REPLACE FUNCTION pgseries._node_legs(
     p_schema NAME, p_table NAME, p_node NAME, p_cschema NAME,
     p_lo TIMESTAMPTZ, p_hi TIMESTAMPTZ, p_valued BOOLEAN DEFAULT false)
@@ -2458,6 +2460,7 @@ DECLARE
     v_vals   TEXT[];
     v_out    TEXT := '';
     v        TEXT;
+    v_hasnull BOOLEAN;
 BEGIN
     SELECT * INTO pol FROM pgseries.compression_policy
     WHERE series_schema = p_schema AND series_table = p_table;
@@ -2505,6 +2508,10 @@ BEGIN
                       s.time_column, p_lo::TEXT, s.time_col_type,
                       s.time_column, p_hi::TEXT, s.time_col_type);
     END IF;
+    -- No catch-all: the value list is exhaustive by construction
+    -- (capped DISTINCT below the LIMIT), so unknown values cannot
+    -- exist in this sibling. NULL segby rows get their own leg only
+    -- when present (checked, not assumed).
     FOREACH v IN ARRAY v_vals LOOP
         v_out := v_out || format(
             ' UNION ALL SELECT u.* FROM %s AS c, LATERAL %s(c) AS u '
@@ -2514,14 +2521,18 @@ BEGIN
             s.time_column, p_hi::TEXT, s.time_col_type,
             v_seg, v, v_segt);
     END LOOP;
-    v_out := v_out || format(
-        ' UNION ALL SELECT u.* FROM %s AS c, LATERAL %s(c) AS u '
-        || 'WHERE u.%I >= %L::%s AND u.%I < %L::%s '
-        || 'AND (u.%I <> ALL (%L::%s[]) OR u.%I IS NULL)',
-        v_cpart, v_unpack,
-        s.time_column, p_lo::TEXT, s.time_col_type,
-        s.time_column, p_hi::TEXT, s.time_col_type,
-        v_seg, v_vals, v_segt, v_seg);
+    EXECUTE format('SELECT EXISTS (SELECT 1 FROM %s WHERE %I IS NULL)',
+                   v_cpart, v_seg)
+    INTO v_hasnull;
+    IF v_hasnull THEN
+        v_out := v_out || format(
+            ' UNION ALL SELECT u.* FROM %s AS c, LATERAL %s(c) AS u '
+            || 'WHERE u.%I >= %L::%s AND u.%I < %L::%s AND u.%I IS NULL',
+            v_cpart, v_unpack,
+            s.time_column, p_lo::TEXT, s.time_col_type,
+            s.time_column, p_hi::TEXT, s.time_col_type,
+            v_seg);
+    END IF;
     RETURN v_out;
 END;
 $$;

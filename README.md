@@ -121,8 +121,9 @@ does not (STABLE never const-folds — use prepare or `_read_range`).
 Per-query shape choice, no flag: the base view carries time legs
 (unpack each segment once — safe default for GROUP BY analytics),
 and `<table>_byseg` (single-column `segmentby` only) carries one
-leg per value plus catch-all, so segby-selective queries prune
-per value. Querying every value leg costs ~5.6x a time leg on
+leg per value (NULLs get a leg only when present — no catch-all:
+the value list is exhaustive by construction), so segby-selective
+queries prune per value. Querying every value leg costs ~5.6x a time leg on
 segby-less ranges (measured) — pick per query, not per table.
 
 Two automatic guards (with `NOTICE`, stored resolved):
