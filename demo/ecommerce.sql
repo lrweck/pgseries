@@ -9,6 +9,7 @@
 \pset footer off
 
 DO $$ BEGIN RAISE NOTICE '--- 1. 200K pedidos, 90 dias, 11 colunas ---'; END $$;
+DROP VIEW IF EXISTS public.pedidos_demo CASCADE;
 DROP TABLE IF EXISTS public.pedidos_demo CASCADE;
 CREATE TABLE public.pedidos_demo (
   ts        TIMESTAMPTZ NOT NULL,
