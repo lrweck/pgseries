@@ -1888,6 +1888,67 @@ BEGIN
 END;
 $$;
 
+-- Remove a series table from management. With p_drop_data (default)
+-- the heap, chunks, DEFAULT partition, compressed tree and views go
+-- away; with false the table stays as a plain partitioned table
+-- (reverse of adopt_partitioned_table) and only the catalog, jobs
+-- and policy are removed. Compressed chunks are decompressed first
+-- so no rows are ever lost silently.
+CREATE OR REPLACE FUNCTION pgseries.drop_series_table(
+    p_schema NAME, p_table NAME, p_drop_data BOOLEAN DEFAULT true)
+RETURNS TEXT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pgseries, pg_catalog
+AS $$
+DECLARE
+    r       RECORD;
+    v_n     BIGINT;
+BEGIN
+    PERFORM pgseries._series(p_schema, p_table);
+    PERFORM pgseries._table_lock(p_schema, p_table);
+
+    FOR r IN SELECT c.chunk_name
+             FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id)
+             WHERE c.series_schema = p_schema AND c.series_table = p_table
+               AND l.state IN ('compressing', 'compressed')
+             ORDER BY c.range_lower NULLS LAST LOOP
+        PERFORM pgseries.decompress_chunk(p_schema, p_table, r.chunk_name);
+    END LOOP;
+
+    IF EXISTS (SELECT 1 FROM pgseries.compression_policy
+               WHERE series_schema = p_schema AND series_table = p_table) THEN
+        PERFORM pgseries.drop_compression_policy(p_schema, p_table);
+    END IF;
+
+    IF p_drop_data THEN
+        EXECUTE format('DROP TABLE %I.%I', p_schema, p_table);
+        -- Chunk catalog goes with the data (leases cascade).
+        DELETE FROM pgseries.chunk
+        WHERE series_schema = p_schema AND series_table = p_table;
+        GET DIAGNOSTICS v_n = ROW_COUNT;
+    ELSE
+        SELECT count(*) INTO v_n FROM pgseries.chunk
+        WHERE series_schema = p_schema AND series_table = p_table;
+        DELETE FROM pgseries.chunk
+        WHERE series_schema = p_schema AND series_table = p_table;
+    END IF;
+    DELETE FROM pgseries.dimension
+    WHERE series_schema = p_schema AND series_table = p_table;
+    DELETE FROM pgseries.job
+    WHERE target_schema = p_schema AND target_table = p_table;
+    DELETE FROM pgseries.series_table
+    WHERE series_schema = p_schema AND series_table = p_table;
+    IF p_drop_data THEN
+        RETURN format('dropped series table %I.%I (%s chunks)',
+                      p_schema, p_table, v_n);
+    ELSE
+        RETURN format('unregistered series table %I.%I, data kept (%s chunks detached from management)',
+                      p_schema, p_table, v_n);
+    END IF;
+END;
+$$;
+
 -- Transparent read path for a compressed table: the UNION view under
 -- the BASE name (the spec's `create view <table>`), a
 -- backwards-compatible <table>_read alias, and a range fast path whose

@@ -18,5 +18,7 @@ sleep 2
 
 echo "== install =="
 psql -h "$SOCK" -p "$PORT" -d postgres -v ON_ERROR_STOP=1 -f "$HERE/pgseries.sql"
+echo "== reinstall (upgrade-path coverage: same file twice must be a no-op) =="
+psql -h "$SOCK" -p "$PORT" -d postgres -v ON_ERROR_STOP=1 -f "$HERE/pgseries.sql"
 echo "== smoke =="
 psql -h "$SOCK" -p "$PORT" -d postgres -v ON_ERROR_STOP=1 -f "$HERE/test/smoke.sql"

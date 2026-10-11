@@ -757,4 +757,35 @@ BEGIN
     END IF;
 END $$;
 
+DO $$ BEGIN RAISE NOTICE '--- 26. drop_series_table ---'; END $$;
+SELECT pgseries.compress_chunk('public', 'f1',
+    (SELECT chunk_name FROM pgseries.show_chunks('public', 'f1') LIMIT 1), 1) AS f1c;
+SELECT pgseries.drop_series_table('public', 'f1') AS drop_full;
+DO $$
+BEGIN
+    IF to_regclass('public.f1') IS NOT NULL THEN RAISE EXCEPTION 'f1 table survived'; END IF;
+    IF to_regclass('public.f1_heap') IS NOT NULL THEN RAISE EXCEPTION 'f1 heap survived'; END IF;
+    IF EXISTS (SELECT 1 FROM pgseries.chunk WHERE series_table = 'f1') THEN
+        RAISE EXCEPTION 'f1 catalog survived';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pgseries.series_table WHERE series_table = 'f1') THEN
+        RAISE EXCEPTION 'f1 registration survived';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pgseries.job WHERE target_table = 'f1') THEN
+        RAISE EXCEPTION 'f1 jobs survived';
+    END IF;
+END $$;
+-- unregister-only path: data stays as a plain partitioned table.
+SELECT pgseries.drop_series_table('public', 'dd', false) AS drop_keep;
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM public.dd) <> 1200 THEN
+        RAISE EXCEPTION 'unregister must keep data';
+    END IF;
+    IF to_regclass('public.dd') IS NULL THEN RAISE EXCEPTION 'dd table gone'; END IF;
+    IF EXISTS (SELECT 1 FROM pgseries.series_table WHERE series_table = 'dd') THEN
+        RAISE EXCEPTION 'dd registration survived';
+    END IF;
+END $$;
+
 SELECT 'SMOKE OK' AS result;
