@@ -114,7 +114,13 @@ further: one `UNION ALL` leg per compressed sibling, each carrying
 its chunk bounds (plus one leg per `segmentby` value when narrow)
 as statically-true quals — with `constraint_exclusion = on`,
 ranged queries prune dead legs at plan time (pure-SQL pushdown;
-see `tune()`).
+see `tune()`). With `value_legs => true` on the policy, each leg
+further splits per `segmentby` value (plus catch-all), so
+segby-selective queries prune per value too — at a price: queries
+*without* a segby predicate unpack every value leg (~5.6x slower
+measured on a segby-less range vs time legs). Default off;
+opt in for device-lookup-shaped tables, keep off for GROUP BY
+analytics.
 
 Two automatic guards (with `NOTICE`, stored resolved):
 

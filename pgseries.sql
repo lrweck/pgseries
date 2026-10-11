@@ -158,12 +158,15 @@ CREATE TABLE IF NOT EXISTS pgseries.compression_policy (
     segment_rows   INTEGER NOT NULL DEFAULT 1000,
     codecs         JSONB NOT NULL DEFAULT '{}',
     requant        JSONB NOT NULL DEFAULT '{}',
+    value_legs     BOOLEAN NOT NULL DEFAULT false,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (series_schema, series_table)
 );
 
 -- v0.2 migrations (idempotent; earlier installs predate them).
 ALTER TABLE pgseries.chunk ADD COLUMN IF NOT EXISTS parent_chunk NAME;
+ALTER TABLE pgseries.compression_policy
+    ADD COLUMN IF NOT EXISTS value_legs BOOLEAN NOT NULL DEFAULT false;
 -- seg_space on every compressed tree (cascades to partitions).
 DO $$ DECLARE r RECORD; BEGIN
     FOR r IN SELECT series_schema, series_table
@@ -2048,7 +2051,8 @@ CREATE OR REPLACE FUNCTION pgseries.add_compression_policy(
     p_orderby_desc BOOLEAN DEFAULT false,
     p_segment_rows INTEGER DEFAULT 1000,
     p_codecs JSONB DEFAULT '{}',
-    p_requant JSONB DEFAULT '{}')
+    p_requant JSONB DEFAULT '{}',
+    p_value_legs BOOLEAN DEFAULT false)
 RETURNS VOID
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -2170,10 +2174,11 @@ BEGIN
 
     INSERT INTO pgseries.compression_policy
         (series_schema, series_table, segmentby, orderby, orderby_desc,
-         segment_rows, codecs, requant)
+         segment_rows, codecs, requant, value_legs)
     VALUES (p_schema, p_table, COALESCE(p_segmentby, '{}'), v_ob,
             p_orderby_desc, p_segment_rows,
-            COALESCE(p_codecs, '{}'), COALESCE(p_requant, '{}'));
+            COALESCE(p_codecs, '{}'), COALESCE(p_requant, '{}'),
+            COALESCE(p_value_legs, false));
 
     -- The swap renames the heap aside and generates the unpack
     -- (heap-bound return type), transparent base view + DML triggers.
@@ -2456,6 +2461,17 @@ BEGIN
     SELECT * INTO s FROM pgseries.series_table
     WHERE series_schema = p_schema AND series_table = p_table;
     IF COALESCE(array_length(pol.segmentby, 1), 0) <> 1 THEN
+        RETURN format(' UNION ALL SELECT u.* FROM %s AS c, LATERAL %s(c) AS u '
+                      || 'WHERE u.%I >= %L::%s AND u.%I < %L::%s',
+                      v_cpart, v_unpack,
+                      s.time_column, p_lo::TEXT, s.time_col_type,
+                      s.time_column, p_hi::TEXT, s.time_col_type);
+    END IF;
+    -- Opt-in per policy: value legs prune segby-selective queries
+    -- but multiply unpack work by (distinct+1) for queries without a
+    -- segby predicate (measured 5.6x slower on a segby-less range).
+    -- Default off; GROUP BY analytics wants time legs.
+    IF NOT COALESCE(pol.value_legs, false) THEN
         RETURN format(' UNION ALL SELECT u.* FROM %s AS c, LATERAL %s(c) AS u '
                       || 'WHERE u.%I >= %L::%s AND u.%I < %L::%s',
                       v_cpart, v_unpack,

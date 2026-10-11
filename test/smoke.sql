@@ -386,7 +386,7 @@ BEGIN
     IF v_c ->> 'r' <> 'for' THEN RAISE EXCEPTION 'auto failed for noise: %', v_c; END IF;
     IF v_c::TEXT LIKE '%auto%' THEN RAISE EXCEPTION 'unresolved auto stored: %', v_c; END IF;
 END $$;
-SELECT pgseries.add_compression_policy('public', 'metrics', '{device}', 't', false, 100, '{"t": "delta"}');
+SELECT pgseries.add_compression_policy('public', 'metrics', '{device}', 't', false, 100, '{"t": "delta"}', '{}', true);
 DO $$
 BEGIN
     IF (SELECT count(*) FROM pgseries_information.compression_settings
