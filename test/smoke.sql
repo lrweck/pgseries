@@ -412,6 +412,23 @@ BEGIN
     END IF;
 END $$;
 
+DO $$ BEGIN RAISE NOTICE '--- 15b. dict guard resolves uuid to raw ---'; END $$;
+CREATE TABLE public.g1 (t TIMESTAMPTZ NOT NULL, u UUID DEFAULT gen_random_uuid(), v INT);
+INSERT INTO public.g1
+SELECT '2026-02-01 00:00+00'::timestamptz + (s || ' minutes')::INTERVAL, gen_random_uuid(), s
+FROM generate_series(1, 1500) AS s;
+SELECT pgseries.create_series_table('public', 'g1', 't', '1 day');
+SELECT pgseries.move_default('public', 'g1');
+SELECT pgseries.add_compression_policy('public', 'g1', '{}', 't');
+DO $$
+BEGIN
+    IF (SELECT codecs ->> 'u' FROM pgseries.compression_policy
+        WHERE series_table = 'g1') <> 'raw' THEN
+        RAISE EXCEPTION 'dict guard must resolve uuid to raw, got %',
+            (SELECT codecs FROM pgseries.compression_policy WHERE series_table = 'g1');
+    END IF;
+END $$;
+
 DO $$ BEGIN RAISE NOTICE '--- 16. compress roundtrip ---'; END $$;
 CREATE TABLE public.metrics_pre AS SELECT * FROM public.metrics;
 CREATE TEMP TABLE pgseries_victim AS
