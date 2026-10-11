@@ -209,8 +209,8 @@ DO $$ BEGIN RAISE NOTICE '--- 7. tune() print mode ---'; END $$;
 SELECT * FROM pgseries.tune();
 DO $$
 BEGIN
-    IF (SELECT count(*) FROM pgseries.tune()) <> 7 THEN
-        RAISE EXCEPTION 'tune must return 7 rows';
+    IF (SELECT count(*) FROM pgseries.tune()) <> 8 THEN
+        RAISE EXCEPTION 'tune must return 8 rows';
     END IF;
     IF EXISTS (SELECT 1 FROM pgseries.tune() WHERE applied) THEN
         RAISE EXCEPTION 'print mode must not apply anything';
@@ -886,5 +886,99 @@ BEGIN
         RAISE EXCEPTION 'orphan leaf without node or table';
     END IF;
 END $$;
+
+DO $$ BEGIN RAISE NOTICE '--- 28. plain DROP TABLE cascades ---'; END $$;
+DO $$
+DECLARE v_has_trg BOOLEAN;
+BEGIN
+    SELECT EXISTS (SELECT 1 FROM pg_event_trigger
+                   WHERE evtname = 'pgseries_series_drop') INTO v_has_trg;
+    IF NOT v_has_trg THEN
+        RAISE NOTICE 'pgseries_series_drop missing (restricted install); cascade asserts skipped';
+        RETURN;
+    END IF;
+END $$;
+CREATE TABLE public.d1 (t TIMESTAMPTZ NOT NULL, v INT);
+INSERT INTO public.d1
+SELECT now() - '40 days'::INTERVAL - (s || ' minutes')::INTERVAL, s
+FROM generate_series(1, 1500) AS s;
+SELECT pgseries.create_series_table('public', 'd1', 't', '1 day');
+SELECT pgseries.move_default('public', 'd1');
+SELECT pgseries.add_compression_policy('public', 'd1', '{}', 't', false, 100, '{"t": "delta"}');
+SELECT pgseries.compress_chunk('public', 'd1',
+    (SELECT chunk_name FROM pgseries.show_chunks('public', 'd1') LIMIT 1), 1);
+-- Compressed tables live under a transparent view: DROP VIEW (plain
+-- DROP TABLE errors with a hint; CASCADE takes the _read alias).
+-- The event-trigger cascade handles the rest.
+DROP VIEW public.d1 CASCADE;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_event_trigger
+                   WHERE evtname = 'pgseries_series_drop') THEN
+        RETURN; -- restricted install, asserts above skipped
+    END IF;
+    IF to_regclass('public.d1') IS NOT NULL THEN RAISE EXCEPTION 'd1 base survived'; END IF;
+    IF to_regclass('public.d1_heap') IS NOT NULL THEN RAISE EXCEPTION 'd1 heap survived'; END IF;
+    IF to_regclass('public.d1_compressed') IS NOT NULL THEN RAISE EXCEPTION 'd1 tree survived'; END IF;
+    IF to_regclass('public.d1_read') IS NOT NULL THEN RAISE EXCEPTION 'd1 view survived'; END IF;
+    IF to_regproc('pgseries.unpack_public_d1') IS NOT NULL THEN
+        RAISE EXCEPTION 'd1 unpack survived';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pgseries.chunk WHERE series_table = 'd1') THEN
+        RAISE EXCEPTION 'd1 chunks survived';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pgseries.series_table WHERE series_table = 'd1') THEN
+        RAISE EXCEPTION 'd1 registration survived';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pgseries.job WHERE target_table = 'd1') THEN
+        RAISE EXCEPTION 'd1 jobs survived';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pgseries.compression_policy WHERE series_table = 'd1') THEN
+        RAISE EXCEPTION 'd1 policy survived';
+    END IF;
+END $$;
+-- uncompressed table: plain drop cleans the catalog too.
+CREATE TABLE public.d2 (t TIMESTAMPTZ NOT NULL, v INT);
+SELECT pgseries.create_series_table('public', 'd2', 't', '1 day');
+DROP TABLE public.d2;
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_event_trigger
+                   WHERE evtname = 'pgseries_series_drop') THEN
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pgseries.series_table WHERE series_table = 'd2') THEN
+        RAISE EXCEPTION 'd2 registration survived';
+    END IF;
+END $$;
+
+DO $$ BEGIN RAISE NOTICE '--- 29. union-leg pruning on base view ---'; END $$;
+SET constraint_exclusion = on;
+DO $$
+DECLARE v_def TEXT; v_victim TEXT; v_n BIGINT;
+BEGIN
+    SELECT victim INTO v_victim FROM pgseries_victim;
+    -- legs exist with the victim's bounds (mechanism present).
+    SELECT pg_get_viewdef(to_regclass('public.metrics')) INTO v_def;
+    IF position(v_victim || '_compressed' IN v_def) = 0 THEN
+        RAISE EXCEPTION 'no compressed leg for victim in base view';
+    END IF;
+    IF position('u.t >=' IN v_def) = 0 THEN
+        RAISE EXCEPTION 'legs carry no static time-bound quals';
+    END IF;
+    -- ranged reads stay exact with pruning enabled.
+    SELECT count(*) INTO v_n FROM public.metrics
+    WHERE t >= now() - INTERVAL '3 days' AND t <= now();
+    IF v_n <> (SELECT count(*) FROM public.metrics_read_range(
+                   now() - INTERVAL '3 days', now())) THEN
+        RAISE EXCEPTION 'legged view diverged from fast path';
+    END IF;
+    -- unpack marked parallel-safe; range fn restricted.
+    IF (SELECT p.proparallel <> 's' FROM pg_proc p
+        WHERE p.proname = 'unpack_public_metrics') THEN
+        RAISE EXCEPTION 'unpack must be parallel-safe';
+    END IF;
+END $$;
+RESET constraint_exclusion;
 
 SELECT 'SMOKE OK' AS result;

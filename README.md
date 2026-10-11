@@ -170,6 +170,22 @@ Late writes to compressed ranges land in the chunk's heap staging
 (`staging` mode, default) and merge on the next compress; reads see
 them immediately through the view.
 
+## Dropping
+
+```sql
+SELECT pgseries.drop_series_table('public','m1');         -- everything gone
+SELECT pgseries.drop_series_table('public','m1', false);  -- unregister only, data stays
+DROP TABLE public.m1;  -- also works (DROP VIEW ... CASCADE
+                       -- once compressed: base name is a view then).
+                       -- A drop-cascade event trigger unregisters
+                       -- policy, chunks, tree and views either way.
+```
+Plain `DROP TABLE` on a series table (or its `<table>_heap`) fires
+`pgseries_series_drop`, which removes the policy, catalog rows, jobs,
+compressed tree, views and generated functions. Creating the trigger
+needs superuser at install; restricted installs print a NOTICE and
+keep working — use `drop_series_table()` there.
+
 ## Measured (local NVMe, PG 18)
 
 | Shape | Rows | Heap | Compressed | Ratio |

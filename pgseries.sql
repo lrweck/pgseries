@@ -1162,6 +1162,7 @@ DECLARE
     r        RECORD;
     v_node   TEXT := '';
     v_cschema NAME;
+    q        RECORD;
 BEGIN
     PERFORM pgseries._series(p_schema, p_table);
     -- v0.3+ will refuse chunks overlapping a cagg refresh window here.
@@ -1195,8 +1196,18 @@ BEGIN
             RETURN NEXT (v_cschema::TEXT || '.' || r.node::TEXT);
             CONTINUE;
         END IF;
-        PERFORM pgseries._lease_transition(
-            r.chunk_schema, r.chunk_name, 'leased_for_drop');
+        -- Flip every leaf first so the refresh below drops the
+        -- node's leg; the subsequent DROPs then hit no dependents.
+        FOR q IN
+            SELECT c2.chunk_schema, c2.chunk_name
+            FROM pgseries.chunk c2
+            WHERE c2.series_schema = p_schema AND c2.series_table = p_table
+              AND COALESCE(c2.parent_chunk, c2.chunk_name) = r.node
+        LOOP
+            PERFORM pgseries._lease_transition(
+                q.chunk_schema, q.chunk_name, 'leased_for_drop');
+        END LOOP;
+        PERFORM pgseries.refresh_read_view(p_schema, p_table);
         -- The node DROP cascades to hash leaves; the shared
         -- compressed sibling goes with it.
         EXECUTE format('DROP TABLE %I.%I', v_cschema, r.node);
@@ -1234,7 +1245,8 @@ BEGIN
         ('checkpoint_timeout', '15min', 'fewer checkpoints under bulk load'),
         ('checkpoint_completion_target', '0.9', 'spread checkpoint I/O'),
         ('wal_buffers', '64MB', 'absorb bursty writers'),
-        ('effective_io_concurrency', '200', 'NVMe-friendly planner costing')
+        ('effective_io_concurrency', '200', 'NVMe-friendly planner costing'),
+        ('constraint_exclusion', 'on', 'UNION-leg pruning on the transparent base view (plan-time)')
     LOOP
         applied := false;
         setting_name := rec.column1;
@@ -1592,6 +1604,7 @@ BEGIN
             VALUES (v_id, 'ready');
         END LOOP;
     END LOOP;
+    PERFORM pgseries.refresh_read_view(p_schema, p_table);
 END;
 $$;
 
@@ -1852,6 +1865,7 @@ BEGIN
     IF NOT pgseries._is_transparent(p_schema, p_table) THEN
         RETURN;
     END IF;
+    EXECUTE 'SET LOCAL pgseries.suppress_drop_trigger = ''on''';
     EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table || '_read');
     EXECUTE format('DROP FUNCTION IF EXISTS %I.%I(%s, %s)',
                    p_schema, p_table || '_read_range',
@@ -2195,6 +2209,7 @@ DECLARE
     v_slug TEXT := pgseries._slug(p_schema, p_table);
     v_n    BIGINT;
 BEGIN
+    EXECUTE 'SET LOCAL pgseries.suppress_drop_trigger = ''on''';
     IF NOT EXISTS (SELECT 1 FROM pgseries.compression_policy
                    WHERE series_schema = p_schema
                      AND series_table = p_table) THEN
@@ -2220,6 +2235,100 @@ BEGIN
 END;
 $$;
 
+-- Idempotent full unregister: drops every pgseries-owned object by
+-- name (IF EXISTS) and deletes all catalog rows. The DROP TABLE/ VIEW
+-- event trigger calls this when the user drops a series table by
+-- hand; drop_series_table() shares it via the same suppression flag.
+-- Safe to run twice (second pass is all no-ops).
+CREATE OR REPLACE FUNCTION pgseries._unregister_series(
+    p_schema NAME, p_table NAME)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pgseries, pg_catalog
+AS $$
+DECLARE
+    v_heap NAME := pgseries._heap_name(p_table);
+    v_slug TEXT := pgseries._slug(p_schema, p_table);
+    r      RECORD;
+    s      pgseries.series_table%ROWTYPE;
+BEGIN
+    EXECUTE 'SET LOCAL pgseries.suppress_drop_trigger = ''on''';
+    SELECT * INTO s FROM pgseries.series_table
+    WHERE series_schema = p_schema AND series_table = p_table;
+    -- Views first (INSTEAD OF triggers die with the base view).
+    EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table);
+    EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table || '_read');
+    IF FOUND THEN
+        EXECUTE format('DROP FUNCTION IF EXISTS %I.%I(%s, %s)',
+                       p_schema, p_table || '_read_range',
+                       s.time_col_type, s.time_col_type);
+    END IF;
+    -- Heap (chunks + DEFAULT go with it) and compressed tree.
+    EXECUTE format('DROP TABLE IF EXISTS %I.%I CASCADE', p_schema, v_heap);
+    EXECUTE format('DROP TABLE IF EXISTS %I.%I CASCADE',
+                   p_schema, p_table || '_compressed');
+    -- Generated functions (any signature — types may be gone already).
+    FOR r IN SELECT format('DROP FUNCTION IF EXISTS %I.%I(%s)',
+                           n.nspname, p.proname,
+                           pg_get_function_identity_arguments(p.oid)) AS stmt
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname IN ('pgseries', p_schema::TEXT)
+               AND p.proname IN ('unpack_' || v_slug,
+                                 'write_' || v_slug || '_ins',
+                                 'write_' || v_slug || '_upd',
+                                 'write_' || v_slug || '_del',
+                                 p_table::TEXT || '_read_range') LOOP
+        EXECUTE r.stmt;
+    END LOOP;
+    DELETE FROM pgseries.compression_policy
+    WHERE series_schema = p_schema AND series_table = p_table;
+    DELETE FROM pgseries.chunk
+    WHERE series_schema = p_schema AND series_table = p_table;
+    DELETE FROM pgseries.dimension
+    WHERE series_schema = p_schema AND series_table = p_table;
+    DELETE FROM pgseries.job
+    WHERE target_schema = p_schema AND target_table = p_table;
+    DELETE FROM pgseries.series_table
+    WHERE series_schema = p_schema AND series_table = p_table;
+END;
+$$;
+
+-- sql_drop hook: plain DROP TABLE/VIEW on a series table (or
+-- its heap) unregisters everything. Internal DROPs set
+-- pgseries.suppress_drop_trigger (SET LOCAL) first.
+CREATE OR REPLACE FUNCTION pgseries._on_series_drop()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pgseries, pg_catalog
+AS $$
+DECLARE
+    r RECORD;
+    s RECORD;
+BEGIN
+    IF current_setting('pgseries.suppress_drop_trigger', true) = 'on' THEN
+        RETURN;
+    END IF;
+    -- sql_drop (not ddl_command_end): only dropped_objects() lists
+    -- DROPs — ddl_commands() never does. Same-transaction atomicity:
+    -- if the user's DROP fails, this unregister rolls back with it.
+    FOR r IN SELECT * FROM pg_event_trigger_dropped_objects() LOOP
+        IF r.object_type NOT IN ('table', 'view') THEN
+            CONTINUE;
+        END IF;
+        SELECT * INTO s FROM pgseries.series_table
+        WHERE series_schema::TEXT = r.schema_name
+          AND (series_table::TEXT = r.object_name
+               OR pgseries._heap_name(series_table)::TEXT = r.object_name);
+        IF FOUND THEN
+            PERFORM pgseries._unregister_series(
+                s.series_schema, s.series_table);
+        END IF;
+    END LOOP;
+END;
+$$;
+
 -- Remove a series table from management. With p_drop_data (default)
 -- the heap, chunks, DEFAULT partition, compressed tree and views go
 -- away; with false the table stays as a plain partitioned table
@@ -2239,6 +2348,7 @@ DECLARE
 BEGIN
     PERFORM pgseries._series(p_schema, p_table);
     PERFORM pgseries._table_lock(p_schema, p_table);
+    EXECUTE 'SET LOCAL pgseries.suppress_drop_trigger = ''on''';
 
     FOR r IN SELECT c.chunk_name
              FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id)
@@ -2287,6 +2397,30 @@ $$;
 -- seg-bound quals hit BRIN before the LATERAL unnest fires (the
 -- spec's load-bearing plan shape). Heap is addressed explicitly: bulk
 -- readers that want heap-only (movers, benchmarks) bypass the view.
+-- Rebuild the read views/legs in place (idempotent). Called after
+-- every operation that changes the sibling set: compress,
+-- decompress, retention drops, add_dimension.
+CREATE OR REPLACE FUNCTION pgseries.refresh_read_view(
+    p_schema NAME, p_table NAME)
+RETURNS VOID
+LANGUAGE plpgsql VOLATILE
+SECURITY DEFINER
+SET search_path = pgseries, pg_catalog
+AS $$
+DECLARE
+    v_ddl TEXT;
+BEGIN
+    PERFORM pgseries._series(p_schema, p_table);
+    -- No transparent view installed (pre-policy tables): nothing to do.
+    IF NOT pgseries._is_transparent(p_schema, p_table) THEN
+        RETURN;
+    END IF;
+    FOR v_ddl IN SELECT * FROM pgseries._read_ddl(p_schema, p_table) LOOP
+        EXECUTE v_ddl;
+    END LOOP;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION pgseries._read_ddl(
     p_schema NAME, p_table NAME)
 RETURNS SETOF TEXT
@@ -2300,19 +2434,67 @@ DECLARE
     v_unpack TEXT := 'pgseries.unpack_' || pgseries._slug(p_schema, p_table);
     v_view  TEXT := format('%I.%I', p_schema, p_table || '_read');
     v_range TEXT := format('%I.%I', p_schema, p_table || '_read_range');
+    v_legs  TEXT := '';
+    v_orpha TEXT := '';
 BEGIN
     s := pgseries._series(p_schema, p_table);
+    -- Per-sibling legs with statically-true range quals (see below).
+    SELECT COALESCE(string_agg(
+               format(' UNION ALL SELECT u.* FROM %I.%I AS c, '
+                      || 'LATERAL %s(c) AS u '
+                      || 'WHERE u.%I >= %L::%s AND u.%I < %L::%s',
+                      legs.cschema, legs.cpart, v_unpack,
+                      s.time_column, legs.lo::TEXT, s.time_col_type,
+                      s.time_column, legs.hi::TEXT, s.time_col_type),
+               ' '), '')
+    INTO v_legs
+    FROM (SELECT t.cs AS cschema,
+                 (t.node::TEXT || '_compressed')::NAME AS cpart,
+                 min(c.range_lower) AS lo, max(c.range_upper) AS hi
+          FROM (SELECT DISTINCT COALESCE(ch.parent_chunk, ch.chunk_name) AS node,
+                                ch.chunk_schema AS cs
+                FROM pgseries.chunk ch
+                JOIN pgseries.chunk_lease lh USING (chunk_id)
+                WHERE ch.series_schema = p_schema
+                  AND ch.series_table = p_table
+                  AND lh.state IN ('compressing', 'compressed')) t
+          JOIN pgseries.chunk c
+            ON c.chunk_schema = t.cs
+           AND COALESCE(c.parent_chunk, c.chunk_name) = t.node
+           AND c.series_schema = p_schema
+           AND c.series_table = p_table
+          WHERE to_regclass(format('%I.%I', t.cs,
+                     (t.node::TEXT || '_compressed')::NAME)) IS NOT NULL
+          GROUP BY t.cs, t.node
+          HAVING min(c.range_lower) IS NOT NULL) legs;
+    -- Siblings without catalog bounds: unprunable fallback legs
+    -- (always correct, never skipped).
+    SELECT COALESCE(string_agg(
+               format(' UNION ALL SELECT u.* FROM %I.%I AS c, '
+                      || 'LATERAL %s(c) AS u',
+                      n.nspname, co.relname, v_unpack), ' '), '')
+    INTO v_orpha
+    FROM pg_class co
+    JOIN pg_namespace n ON n.oid = co.relnamespace
+    JOIN pg_inherits h ON h.inhrelid = co.oid
+    WHERE h.inhparent = to_regclass(v_tpl)
+      AND NOT EXISTS (
+          SELECT 1 FROM pgseries.chunk cc
+          WHERE cc.series_schema = p_schema
+            AND cc.series_table = p_table
+            AND (COALESCE(cc.parent_chunk, cc.chunk_name)::TEXT
+                 || '_compressed') = co.relname
+            AND cc.chunk_schema = n.nspname
+            AND cc.range_lower IS NOT NULL);
     RETURN NEXT
-        format('CREATE OR REPLACE VIEW %I.%I AS SELECT * FROM %s '
-               || 'UNION ALL SELECT u.* FROM %s AS c, '
-               || 'LATERAL %s(c) AS u',
-               p_schema, p_table, v_heap, v_tpl, v_unpack);
+        format('CREATE OR REPLACE VIEW %I.%I AS SELECT * FROM %s%s%s',
+               p_schema, p_table, v_heap, v_legs, v_orpha);
     RETURN NEXT
         format('CREATE OR REPLACE VIEW %s AS SELECT * FROM %I.%I',
                v_view, p_schema, p_table);
     RETURN NEXT
         format('CREATE OR REPLACE FUNCTION %s(a %s, b %s) '
-               || 'RETURNS SETOF %I.%I LANGUAGE sql STABLE '
+               || 'RETURNS SETOF %I.%I LANGUAGE sql STABLE PARALLEL RESTRICTED '
                || 'SET search_path = pgseries, pg_catalog AS %s '
                || 'SELECT * FROM %s WHERE %I >= $1 AND %I <= $2 '
                || 'UNION ALL '
@@ -2451,6 +2633,8 @@ BEGIN
             NULL;
         END;
     END LOOP;
+
+    PERFORM pgseries.refresh_read_view(p_schema, p_table);
 
     RETURN format('compressed %s rows into %s segments (%I)',
                   v_heap, v_segs, v_cpart);
@@ -2665,6 +2849,8 @@ BEGIN
         END;
     END LOOP;
 
+    PERFORM pgseries.refresh_read_view(p_schema, p_table);
+
     RETURN format('compressed %s chunks, %s rows into %s segments',
                   v_nchunk, v_nrows, v_nsegs);
 END;
@@ -2723,6 +2909,9 @@ BEGIN
     GET DIAGNOSTICS v_n = ROW_COUNT;
     EXECUTE format('DELETE FROM %I.%I WHERE seg_space = %s',
         p_schema, v_cpart, v_space);
+    -- Refresh first: the leg is already gone (state flipped above),
+    -- so the conditional DROP below never hits view dependents.
+    PERFORM pgseries.refresh_read_view(p_schema, p_table);
     EXECUTE format('SELECT count(*) FROM %I.%I', p_schema, v_cpart)
     INTO v_left;
     IF v_left = 0 THEN
@@ -3539,7 +3728,7 @@ BEGIN
     -- demand DROP-first upgrades.
     RETURN format(
         'CREATE OR REPLACE FUNCTION %s(seg %s) RETURNS SETOF %I.%I '
-        || 'LANGUAGE sql STABLE SET search_path = pgseries, pg_catalog AS %s '
+        || 'LANGUAGE sql STABLE PARALLEL SAFE SET search_path = pgseries, pg_catalog AS %s '
         || 'SELECT %s FROM (%s) AS qfinal '
         || '%s',
         v_fname, v_tpl, p_schema, pgseries._heap_name(p_table),
@@ -3879,6 +4068,21 @@ $$;
 REVOKE ALL ON ALL TABLES IN SCHEMA pgseries FROM PUBLIC;
 GRANT ALL ON ALL TABLES IN SCHEMA pgseries TO pgseries_admin;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA pgseries TO pgseries_admin;
+-- Drop-cascade hook (best effort: creating event triggers needs
+-- superuser; restricted installs keep working, minus the cascade —
+-- use drop_series_table() there).
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_event_trigger
+               WHERE evtname = 'pgseries_series_drop') THEN
+        EXECUTE 'DROP EVENT TRIGGER pgseries_series_drop';
+    END IF;
+    CREATE EVENT TRIGGER pgseries_series_drop ON sql_drop
+    WHEN TAG IN ('DROP TABLE', 'DROP VIEW')
+    EXECUTE FUNCTION pgseries._on_series_drop();
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'pgseries: skipping drop-cascade event trigger (needs superuser); use drop_series_table() to remove series tables cleanly';
+END $$;
+
 GRANT SELECT ON ALL TABLES IN SCHEMA pgseries_information TO pgseries_reader;
 GRANT SELECT ON ALL TABLES IN SCHEMA pgseries_information TO pgseries_writer;
 GRANT SELECT ON ALL TABLES IN SCHEMA pgseries_information TO pgseries_admin;
