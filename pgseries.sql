@@ -3165,13 +3165,23 @@ BEGIN
     -- missing — still a single scan versus one sorted
     -- count(DISTINCT) per text column before. Counts are recorded for
     -- the dict guard below.
+    -- Segmentby heuristic: lowest-cardinality text-like column.
+    -- Counts come from planner stats when usable, never a full scan:
+    -- (a) heap parent stats if the heap holds rows, (b) stats of the
+    -- most recent compressed sibling (compress ANALYZEs every cpart;
+    -- segby columns are scalars there), (c) exact counts on a bounded
+    -- 20K sample only for columns still missing. Heuristic either
+    -- way; per-chunk estimates beat table-wide guesses for packing.
     <<pick_segby>>
     DECLARE
         v_best_n BIGINT := NULL;
         v_heapq  TEXT := pgseries._write_parent(p_schema, p_table);
         v_nd     NUMERIC;
         v_rel    BIGINT;
-        v_stats_hit BOOLEAN := false;
+        v_src    TEXT;
+        v_css    NAME;
+        v_cpart  NAME;
+        v_built  BOOLEAN := false;
     BEGIN
         IF to_regclass('pg_temp.suggest_nd') IS NULL THEN
             CREATE TEMP TABLE suggest_nd (col NAME PRIMARY KEY, nd BIGINT)
@@ -3180,68 +3190,98 @@ BEGIN
         DELETE FROM suggest_nd;
         SELECT reltuples::BIGINT INTO v_rel FROM pg_class
         WHERE oid = to_regclass(v_heapq);
-        -- Fast path: planner stats on the heap parent (present when the
-        -- heap holds data and has been analyzed).
-        IF COALESCE(v_rel, 0) > 0
-           AND EXISTS (SELECT 1 FROM pg_stats
-                       WHERE schemaname = p_schema::TEXT
-                         AND tablename = pgseries._heap_name(p_table)::TEXT
-                          OR (schemaname = p_schema::TEXT
-                              AND tablename = p_table::TEXT)) THEN
-            v_stats_hit := true;
-        END IF;
-        IF v_stats_hit THEN
-        FOR r IN SELECT * FROM pgseries._colinfo(
-                     p_schema, p_table, s.time_column, '{}')
-                 WHERE kind = 'data' AND class = 'text' LOOP
-            SELECT n_distinct INTO v_nd FROM pg_stats
-            WHERE schemaname = p_schema::TEXT
-              AND tablename IN (pgseries._heap_name(p_table)::TEXT,
-                                p_table::TEXT)
-              AND attname = r.attname::TEXT
-            ORDER BY tablename DESC LIMIT 1;
-            IF v_nd IS NULL THEN
-                CONTINUE;
-            END IF;
-            v_n := CASE WHEN v_nd < 0
-                        THEN ((-v_nd) * COALESCE(v_rel, 0))::BIGINT
-                        ELSE v_nd::BIGINT END;
-            INSERT INTO suggest_nd VALUES (r.attname, v_n)
-            ON CONFLICT (col) DO UPDATE SET nd = EXCLUDED.nd;
-            IF v_n > 1 AND v_n <= 10000
-               AND (v_best_n IS NULL OR v_n < v_best_n) THEN
-                v_best_n := v_n;
-                v_col := r.attname;
-            END IF;
-        END LOOP;
-        ELSE
-            -- Slow path (heap empty or unanalyzed — e.g. fully
-            -- compressed tables): exact counts on one bounded 20K
-            -- sample across both branches. Still no full sort.
-            RAISE NOTICE 'pgseries: no usable heap stats, sampling for segmentby...';
-            EXECUTE 'CREATE TEMP TABLE segby_src AS SELECT * FROM ('
-                    || pgseries._sample_sql(p_schema, p_table, 20000)
-                    || ') s LIMIT 20000';
+        IF COALESCE(v_rel, 0) > 0 THEN
             FOR r IN SELECT * FROM pgseries._colinfo(
                          p_schema, p_table, s.time_column, '{}')
                      WHERE kind = 'data' AND class = 'text' LOOP
+                SELECT n_distinct INTO v_nd FROM pg_stats
+                WHERE schemaname = p_schema::TEXT
+                  AND tablename IN (pgseries._heap_name(p_table)::TEXT,
+                                    p_table::TEXT)
+                  AND attname = r.attname::TEXT
+                ORDER BY tablename DESC LIMIT 1;
+                IF v_nd IS NULL THEN
+                    CONTINUE;
+                END IF;
+                v_n := CASE WHEN v_nd < 0
+                            THEN ((-v_nd) * COALESCE(v_rel, 0))::BIGINT
+                            ELSE v_nd::BIGINT END;
+                INSERT INTO suggest_nd VALUES (r.attname, v_n)
+                ON CONFLICT (col) DO UPDATE SET nd = EXCLUDED.nd;
+            END LOOP;
+            v_src := 'planner stats';
+        END IF;
+        -- Compressed scalars: most recent sibling with stats.
+        SELECT c.chunk_schema,
+               (COALESCE(c.parent_chunk, c.chunk_name)::TEXT
+                || '_compressed')::NAME
+        INTO v_css, v_cpart
+        FROM pgseries.chunk c JOIN pgseries.chunk_lease l USING (chunk_id)
+        WHERE c.series_schema = p_schema AND c.series_table = p_table
+          AND l.state IN ('compressing', 'compressed')
+        ORDER BY c.range_upper DESC NULLS LAST LIMIT 1;
+        IF FOUND THEN
+            SELECT reltuples::BIGINT INTO v_rel FROM pg_class
+            WHERE oid = to_regclass(format('%I.%I', v_css, v_cpart));
+            FOR r IN SELECT * FROM pgseries._colinfo(
+                         p_schema, p_table, s.time_column, '{}')
+                     WHERE kind = 'data' AND class = 'text' LOOP
+                IF EXISTS (SELECT 1 FROM suggest_nd
+                           WHERE col = r.attname) THEN
+                    CONTINUE;
+                END IF;
+                SELECT n_distinct INTO v_nd FROM pg_stats
+                WHERE schemaname = v_css::TEXT
+                  AND tablename = v_cpart::TEXT
+                  AND attname = r.attname::TEXT;
+                IF v_nd IS NULL THEN
+                    CONTINUE;
+                END IF;
+                v_n := CASE WHEN v_nd < 0
+                            THEN ((-v_nd) * COALESCE(v_rel, 0))::BIGINT
+                            ELSE v_nd::BIGINT END;
+                INSERT INTO suggest_nd VALUES (r.attname, v_n)
+                ON CONFLICT (col) DO UPDATE SET nd = EXCLUDED.nd;
+            END LOOP;
+            v_src := COALESCE(v_src || ' + compressed stats', 'compressed stats');
+        END IF;
+        -- Exact sample only for columns still missing.
+        IF EXISTS (SELECT 1 FROM pgseries._colinfo(
+                       p_schema, p_table, s.time_column, '{}') c
+                   WHERE c.kind = 'data' AND c.class = 'text'
+                     AND NOT EXISTS (SELECT 1 FROM suggest_nd
+                                     WHERE col = c.attname)) THEN
+            RAISE NOTICE 'pgseries: sampling for segmentby...';
+            EXECUTE 'CREATE TEMP TABLE segby_src AS SELECT * FROM ('
+                    || pgseries._sample_sql(p_schema, p_table, 20000)
+                    || ') s LIMIT 20000';
+            v_built := true;
+            FOR r IN SELECT * FROM pgseries._colinfo(
+                         p_schema, p_table, s.time_column, '{}')
+                     WHERE kind = 'data' AND class = 'text' LOOP
+                IF EXISTS (SELECT 1 FROM suggest_nd
+                           WHERE col = r.attname) THEN
+                    CONTINUE;
+                END IF;
                 EXECUTE format('SELECT count(DISTINCT %I) FROM pg_temp.segby_src',
                                r.attname) INTO v_n;
                 INSERT INTO suggest_nd VALUES (r.attname, v_n)
                 ON CONFLICT (col) DO UPDATE SET nd = EXCLUDED.nd;
-                IF v_n > 1 AND v_n <= 10000
-                   AND (v_best_n IS NULL OR v_n < v_best_n) THEN
-                    v_best_n := v_n;
-                    v_col := r.attname;
-                END IF;
             END LOOP;
             DROP TABLE pg_temp.segby_src;
+            v_src := COALESCE(v_src || ' + exact sample', 'exact sample');
         END IF;
+        FOR r IN SELECT col, nd FROM suggest_nd LOOP
+            IF r.nd > 1 AND r.nd <= 10000
+               AND (v_best_n IS NULL OR r.nd < v_best_n) THEN
+                v_best_n := r.nd;
+                v_col := r.col;
+            END IF;
+        END LOOP;
         IF v_col IS NOT NULL THEN
             v_seg := ARRAY[v_col];
             RAISE NOTICE 'pgseries: segmentby % (~% distinct values, %)',
-                v_col, v_best_n,
-                CASE WHEN v_stats_hit THEN 'planner stats' ELSE 'exact sample' END;
+                v_col, v_best_n, v_src;
         ELSE
             RAISE NOTICE 'pgseries: no suitable segmentby column, packing ungrouped';
         END IF;
